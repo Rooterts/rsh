@@ -26,6 +26,7 @@ pub struct Pipeline {
 pub enum Unit {
     Pipeline(Pipeline),
     Compound(CompoundCommand),
+    Group(Vec<Job>), // `{ cmd1; cmd2; }` — runs its jobs in the current shell
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,10 @@ pub enum CompoundCommand {
     Case {
         word: String,
         arms: Vec<CaseArm>,
+    },
+    FunctionDef {
+        name: String,
+        body: Vec<Job>,
     },
 }
 
@@ -132,6 +137,7 @@ fn parse_command_list(
 fn is_terminator(tokens: &[Token], i: usize, terminators: &[&str]) -> bool {
     match tokens.get(i) {
         Some(Token::CaseEnd) => true,
+        Some(Token::RBrace) => true, // `{ ...; }` group or function body closing brace
         Some(Token::Word(w)) => terminators.contains(&w.as_str()),
         _ => false,
     }
@@ -167,12 +173,75 @@ fn parse_unit(tokens: &[Token], i: usize) -> Result<(Unit, usize), String> {
                 let (cmd, next) = parse_case(tokens, i + 1)?;
                 return Ok((Unit::Compound(cmd), next));
             }
-            _ => {}
+            _ => {
+                // A `name ()` / `name()` sequence starts a function definition.
+                if matches!(tokens.get(i + 1), Some(Token::LParen)) {
+                    return parse_function(tokens, i);
+                }
+            }
         }
+    }
+
+    // A `{ ...; }` group command.
+    if matches!(tokens.get(i), Some(Token::LBrace)) {
+        let (jobs, next) = parse_group(tokens, i)?;
+        return Ok((Unit::Group(jobs), next));
     }
 
     let (pipeline, next) = parse_pipeline(tokens, i)?;
     Ok((Unit::Pipeline(pipeline), next))
+}
+
+/// Parses `name () { ...; }` (or `name () command`). The body is stored for
+/// later invocation by the executor; definitions do not run anything.
+fn parse_function(tokens: &[Token], i: usize) -> Result<(Unit, usize), String> {
+    let name = match tokens.get(i) {
+        Some(Token::Word(w)) => w.clone(),
+        _ => return Err("expected a function name".to_string()),
+    };
+    let mut i = i + 1;
+
+    if !matches!(tokens.get(i), Some(Token::LParen)) {
+        return Err(format!("expected '(' in function definition of '{}'", name));
+    }
+    i += 1;
+    if !matches!(tokens.get(i), Some(Token::RParen)) {
+        return Err(format!("expected ')' in function definition of '{}'", name));
+    }
+    i += 1;
+
+    let body = if matches!(tokens.get(i), Some(Token::LBrace)) {
+        // `name () { job; job; }`
+        let (jobs, next) = parse_group(tokens, i)?;
+        i = next;
+        jobs
+    } else {
+        // `name () single_command`
+        let (unit, next) = parse_unit(tokens, i)?;
+        i = next;
+        vec![Job {
+            unit,
+            connector: Connector::Seq,
+        }]
+    };
+
+    Ok((
+        Unit::Compound(CompoundCommand::FunctionDef { name, body }),
+        i,
+    ))
+}
+
+/// Parses `{ job; job; ... }` and returns the inner jobs plus the index just
+/// after the closing `}`.
+fn parse_group(tokens: &[Token], i: usize) -> Result<(Vec<Job>, usize), String> {
+    if !matches!(tokens.get(i), Some(Token::LBrace)) {
+        return Err("expected '{'".to_string());
+    }
+    let (jobs, next) = parse_command_list(tokens, i + 1, &[])?;
+    if !matches!(tokens.get(next), Some(Token::RBrace)) {
+        return Err("expected '}' to close the group".to_string());
+    }
+    Ok((jobs, next + 1))
 }
 
 fn parse_if(tokens: &[Token], mut i: usize) -> Result<(IfChain, usize), String> {
@@ -377,7 +446,10 @@ fn parse_simple_command(tokens: &[Token], mut i: usize) -> Result<(SimpleCommand
             | Token::Or
             | Token::Semicolon
             | Token::CaseEnd
+            | Token::LParen
             | Token::RParen
+            | Token::LBrace
+            | Token::RBrace
             | Token::Background => break,
         }
     }

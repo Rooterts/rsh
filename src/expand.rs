@@ -14,6 +14,7 @@ use crate::tokenizer::MARK;
 pub fn expand_args(
     args: &[String],
     shell_vars: &mut HashMap<String, String>,
+    positional: &[String],
     last_status: i32,
     run_subst: &mut dyn FnMut(&str) -> String,
 ) -> Vec<String> {
@@ -21,7 +22,7 @@ pub fn expand_args(
 
     for arg in args {
         let after_subst = expand_command_subst(arg, run_subst);
-        let after_vars = expand_vars(&after_subst, shell_vars, last_status);
+        let after_vars = expand_vars(&after_subst, shell_vars, positional, last_status);
         let after_tilde = expand_tilde(&after_vars);
 
         if has_unmarked_glob_char(&after_tilde) {
@@ -42,11 +43,56 @@ pub fn expand_args(
                 Err(_) => expanded.push(strip_marks(&after_tilde)),
             }
         } else {
-            expanded.push(strip_marks(&after_tilde));
+            // Field splitting: the result of an unquoted expansion ($VAR,
+            // $(...), $@, arithmetic) may contain unmarked whitespace, which
+            // separates it into several fields per IFS. Whitespace that came
+            // from quotes is marked and therefore preserved inside one field.
+            expanded.extend(split_fields(&after_tilde));
         }
     }
 
     expanded
+}
+
+/// Splits a (still MARK-ed) word into fields on runs of unmarked whitespace.
+/// Each returned field has its literalness marks removed. Unmarked whitespace
+/// at the start/end is dropped (IFS trimming); empty fields are skipped.
+fn split_fields(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == MARK {
+            // A marked char is literal/protected: carry it (and its target)
+            // verbatim into the current field, so it is not treated as a split.
+            cur.push(chars[i]);
+            if i + 1 < chars.len() {
+                cur.push(chars[i + 1]);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i].is_whitespace() {
+            if !cur.is_empty() {
+                fields.push(strip_marks(&cur));
+                cur.clear();
+            }
+            i += 1;
+            continue;
+        }
+        cur.push(chars[i]);
+        i += 1;
+    }
+
+    if !cur.is_empty() {
+        fields.push(strip_marks(&cur));
+    }
+
+    fields
 }
 
 /// Finds `$(...)` that are NOT marked (i.e. outside single quotes) and
@@ -67,6 +113,15 @@ fn expand_command_subst(input: &str, run: &mut dyn FnMut(&str) -> String) -> Str
             } else {
                 i += 1;
             }
+            continue;
+        }
+
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
+            // $(( ... )) is arithmetic expansion, handled by expand_vars as a
+            // parameter expansion. Leave it untouched here (just copy the `$`
+            // through so expand_vars sees the `$((` opener).
+            out.push(chars[i]);
+            i += 1;
             continue;
         }
 
@@ -115,7 +170,12 @@ fn mark_all_special(s: &str) -> String {
 /// anything marked literal). Inside double quotes the `?` of `$?` arrives
 /// marked (the tokenizer marks `?` to prevent pathname expansion), so we
 /// also accept `$` + MARK + `?` and treat it as the status expansion.
-fn expand_vars(input: &str, shell_vars: &mut HashMap<String, String>, last_status: i32) -> String {
+fn expand_vars(
+    input: &str,
+    shell_vars: &mut HashMap<String, String>,
+    positional: &[String],
+    last_status: i32,
+) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -133,6 +193,38 @@ fn expand_vars(input: &str, shell_vars: &mut HashMap<String, String>, last_statu
         }
 
         if chars[i] == '$' && i + 1 < chars.len() {
+            // Arithmetic expansion `$(( expr ))`: find the balanced group and
+            // replace it with the integer result.
+            if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
+                let mut depth = 0i32;
+                let mut j = i;
+                while j < chars.len() {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j < chars.len() {
+                    // Inner expression is wrapped in an extra pair of parens
+                    // (chars[i+2..j] == "( expr )"); the evaluator handles them.
+                    // MARK characters are stripped: inside double quotes the
+                    // tokenizer marks `* ? [` as literal to avoid globbing, but
+                    // inside arithmetic they are always operators / wildcards.
+                    let inner: String = chars[i + 2..j].iter().filter(|&&c| c != MARK).collect();
+                    let value = eval_arithmetic(&inner, shell_vars, positional);
+                    out.push_str(&value.to_string());
+                    i = j + 1;
+                    continue;
+                }
+            }
+
             if chars[i + 1] == '?' {
                 out.push_str(&last_status.to_string());
                 i += 2;
@@ -147,11 +239,45 @@ fn expand_vars(input: &str, shell_vars: &mut HashMap<String, String>, last_statu
                 continue;
             }
 
+            // Positional parameters and the "special" single-char params.
+            if chars[i + 1] == '@' {
+                out.push_str(&positional.join(" "));
+                i += 2;
+                continue;
+            }
+            if chars[i + 1] == '#' {
+                out.push_str(&positional.len().to_string());
+                i += 2;
+                continue;
+            }
+            if chars[i + 1].is_ascii_digit() {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let num: usize = chars[i + 1..j]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0);
+                let value = if num == 0 {
+                    "rsh".to_string() // $0 is the shell name
+                } else {
+                    positional
+                        .get(num.saturating_sub(1))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                out.push_str(&value);
+                i = j;
+                continue;
+            }
+
             if chars[i + 1] == '{'
                 && let Some(end_rel) = chars[i + 2..].iter().position(|&c| c == '}')
             {
                 let inner: String = chars[i + 2..i + 2 + end_rel].iter().collect();
-                out.push_str(&expand_braced_param(&inner, shell_vars));
+                out.push_str(&expand_braced_param(&inner, shell_vars, positional));
                 i = i + 2 + end_rel + 1;
                 continue;
             }
@@ -175,11 +301,38 @@ fn expand_vars(input: &str, shell_vars: &mut HashMap<String, String>, last_statu
     out
 }
 
-/// Handles ${NAME}, ${#NAME}, ${NAME:-def}, ${NAME:=def}, ${NAME:?err}, ${NAME:+alt}.
-fn expand_braced_param(inner: &str, shell_vars: &mut HashMap<String, String>) -> String {
+/// Handles ${NAME}, ${#NAME}, ${NAME:-def}, ${NAME:=def}, ${NAME:?err},
+/// ${NAME:+alt}, and the positional forms ${N}, ${@}, ${#}.
+fn expand_braced_param(
+    inner: &str,
+    shell_vars: &mut HashMap<String, String>,
+    positional: &[String],
+) -> String {
+    // ${#NAME} — length of a variable; ${#} — number of positional params.
     if let Some(name) = inner.strip_prefix('#') {
+        if name.is_empty() {
+            return positional.len().to_string();
+        }
         let val = lookup_var(name, shell_vars);
         return val.chars().count().to_string();
+    }
+
+    // ${@}, ${0}, ${N}
+    if !inner.is_empty() {
+        if inner == "@" {
+            return positional.join(" ");
+        }
+        if let Ok(num) = inner.parse::<usize>() {
+            let value = if num == 0 {
+                "rsh".to_string()
+            } else {
+                positional
+                    .get(num.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            return value;
+        }
     }
 
     for op in [":-", ":=", ":?", ":+"] {
@@ -309,6 +462,167 @@ fn strip_marks(s: &str) -> String {
     out
 }
 
+/// Evaluates an integer arithmetic expression with support for `+ - * / %`,
+/// parentheses, unary minus, bare variable names, and `$name`/`$N` references
+/// (whose numeric value is looked up from the shell variables, the positional
+/// parameters, and the environment). On any parse or evaluation problem it
+/// returns 0, matching a lenient `expr`-like behavior.
+fn eval_arithmetic<'a>(
+    input: &str,
+    shell_vars: &'a HashMap<String, String>,
+    positional: &'a [String],
+) -> i64 {
+    struct Arith<'a> {
+        chars: Vec<char>,
+        pos: usize,
+        vars: &'a HashMap<String, String>,
+        positional: &'a [String],
+    }
+
+    impl<'a> Arith<'a> {
+        fn new(s: &str, vars: &'a HashMap<String, String>, positional: &'a [String]) -> Self {
+            Self {
+                chars: s.chars().collect(),
+                pos: 0,
+                vars,
+                positional,
+            }
+        }
+        fn skip_ws(&mut self) {
+            while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
+                self.pos += 1;
+            }
+        }
+        fn peek(&self) -> Option<char> {
+            self.chars.get(self.pos).copied()
+        }
+        fn raw_value(&self, name: &str) -> i64 {
+            if let Ok(num) = name.parse::<usize>() {
+                let v = if num == 0 {
+                    "rsh".to_string()
+                } else {
+                    self.positional
+                        .get(num.saturating_sub(1))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                return v.trim().parse::<i64>().unwrap_or(0);
+            }
+            let raw = self
+                .vars
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| env::var(name).unwrap_or_default());
+            raw.trim().parse::<i64>().unwrap_or(0)
+        }
+        fn expr(&mut self) -> i64 {
+            let mut v = self.term();
+            loop {
+                self.skip_ws();
+                match self.peek() {
+                    Some('+') => {
+                        self.pos += 1;
+                        v += self.term();
+                    }
+                    Some('-') => {
+                        self.pos += 1;
+                        v -= self.term();
+                    }
+                    _ => break,
+                }
+            }
+            v
+        }
+        fn term(&mut self) -> i64 {
+            let mut v = self.factor();
+            loop {
+                self.skip_ws();
+                match self.peek() {
+                    Some('*') => {
+                        self.pos += 1;
+                        v *= self.factor();
+                    }
+                    Some('/') => {
+                        self.pos += 1;
+                        let d = self.factor();
+                        v = if d != 0 { v / d } else { 0 };
+                    }
+                    Some('%') => {
+                        self.pos += 1;
+                        let d = self.factor();
+                        v = if d != 0 { v % d } else { 0 };
+                    }
+                    _ => break,
+                }
+            }
+            v
+        }
+        fn factor(&mut self) -> i64 {
+            self.skip_ws();
+            match self.peek() {
+                Some('-') => {
+                    self.pos += 1;
+                    -self.factor()
+                }
+                Some('+') => {
+                    self.pos += 1;
+                    self.factor()
+                }
+                Some('(') => {
+                    self.pos += 1;
+                    let v = self.expr();
+                    self.skip_ws();
+                    if self.peek() == Some(')') {
+                        self.pos += 1;
+                    }
+                    v
+                }
+                Some('$') => {
+                    // A `$name` / `$N` reference inside the arithmetic.
+                    self.pos += 1;
+                    if self.peek() == Some('{') {
+                        self.pos += 1;
+                    }
+                    let start = self.pos;
+                    while self.pos < self.chars.len()
+                        && (self.chars[self.pos].is_alphanumeric() || self.chars[self.pos] == '_')
+                    {
+                        self.pos += 1;
+                    }
+                    let name: String = self.chars[start..self.pos].iter().collect();
+                    if self.peek() == Some('}') {
+                        self.pos += 1;
+                    }
+                    self.raw_value(&name)
+                }
+                Some(c) if c.is_ascii_digit() => {
+                    let start = self.pos;
+                    while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_digit() {
+                        self.pos += 1;
+                    }
+                    let s: String = self.chars[start..self.pos].iter().collect();
+                    s.parse::<i64>().unwrap_or(0)
+                }
+                Some(c) if c.is_alphabetic() || c == '_' => {
+                    let start = self.pos;
+                    while self.pos < self.chars.len()
+                        && (self.chars[self.pos].is_alphanumeric() || self.chars[self.pos] == '_')
+                    {
+                        self.pos += 1;
+                    }
+                    let name: String = self.chars[start..self.pos].iter().collect();
+                    self.raw_value(&name)
+                }
+                _ => 0,
+            }
+        }
+    }
+
+    let mut a = Arith::new(input, shell_vars, positional);
+    a.skip_ws();
+    a.expr()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,13 +631,16 @@ mod tests {
     fn test_expand_var() {
         let mut vars = HashMap::new();
         vars.insert("FOO".to_string(), "bar".to_string());
-        assert_eq!(expand_vars("hola $FOO!", &mut vars, 0), "hola bar!");
+        assert_eq!(expand_vars("hola $FOO!", &mut vars, &[], 0), "hola bar!");
     }
 
     #[test]
     fn test_expand_status() {
         let mut vars = HashMap::new();
-        assert_eq!(expand_vars("exit code: $?", &mut vars, 42), "exit code: 42");
+        assert_eq!(
+            expand_vars("exit code: $?", &mut vars, &[], 42),
+            "exit code: 42"
+        );
     }
 
     #[test]
@@ -335,19 +652,19 @@ mod tests {
         let mut raw = String::from("status=$");
         raw.push(MARK);
         raw.push('?');
-        assert_eq!(expand_vars(&raw, &mut vars, 7), "status=7");
+        assert_eq!(expand_vars(&raw, &mut vars, &[], 7), "status=7");
     }
 
     #[test]
     fn test_default_value() {
         let mut vars = HashMap::new();
-        assert_eq!(expand_vars("${FOO:-bar}", &mut vars, 0), "bar");
+        assert_eq!(expand_vars("${FOO:-bar}", &mut vars, &[], 0), "bar");
     }
 
     #[test]
     fn test_assign_default() {
         let mut vars = HashMap::new();
-        expand_vars("${FOO:=bar}", &mut vars, 0);
+        expand_vars("${FOO:=bar}", &mut vars, &[], 0);
         assert_eq!(vars.get("FOO"), Some(&"bar".to_string()));
     }
 
@@ -355,7 +672,7 @@ mod tests {
     fn test_length() {
         let mut vars = HashMap::new();
         vars.insert("FOO".to_string(), "hola".to_string());
-        assert_eq!(expand_vars("${#FOO}", &mut vars, 0), "4");
+        assert_eq!(expand_vars("${#FOO}", &mut vars, &[], 0), "4");
     }
 
     #[test]
@@ -364,7 +681,84 @@ mod tests {
         let marked = format!("{}$FOO", MARK); // marked $ = literal
         let mut vars = HashMap::new();
         vars.insert("FOO".to_string(), "bar".to_string());
-        let result = strip_marks(&expand_vars(&marked, &mut vars, 0));
+        let result = strip_marks(&expand_vars(&marked, &mut vars, &[], 0));
         assert_eq!(result, "$FOO");
+    }
+
+    #[test]
+    fn test_arithmetic_basic() {
+        let vars = HashMap::new();
+        assert_eq!(eval_arithmetic("(1+2)", &vars, &[]), 3);
+        assert_eq!(eval_arithmetic("(10-4)", &vars, &[]), 6);
+        assert_eq!(eval_arithmetic("(6*7)", &vars, &[]), 42);
+        assert_eq!(eval_arithmetic("(10/3)", &vars, &[]), 3);
+        assert_eq!(eval_arithmetic("(10%3)", &vars, &[]), 1);
+    }
+
+    #[test]
+    fn test_arithmetic_precedence_and_parens() {
+        let vars = HashMap::new();
+        assert_eq!(eval_arithmetic("((2+3)*4)", &vars, &[]), 20);
+        assert_eq!(eval_arithmetic("(((1+1)*(2+2)))", &vars, &[]), 8);
+        assert_eq!(eval_arithmetic("(-5+2)", &vars, &[]), -3);
+    }
+
+    #[test]
+    fn test_arithmetic_variables() {
+        let mut vars = HashMap::new();
+        vars.insert("n".to_string(), "2".to_string());
+        assert_eq!(eval_arithmetic("(n*5)", &vars, &[]), 10);
+    }
+
+    #[test]
+    fn test_arithmetic_expansion_inside_vars() {
+        // `$((1+2))` expands to the integer result via expand_vars.
+        let mut vars = HashMap::new();
+        assert_eq!(expand_vars("r=$((1+2))", &mut vars, &[], 0), "r=3");
+    }
+
+    #[test]
+    fn test_positional_params() {
+        let mut vars = HashMap::new();
+        let pos = ["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(expand_vars("$1 $2 $3", &mut vars, &pos, 0), "a b c");
+        assert_eq!(expand_vars("$#", &mut vars, &pos, 0), "3");
+        assert_eq!(expand_vars("$@", &mut vars, &pos, 0), "a b c");
+        assert_eq!(expand_vars("$0", &mut vars, &pos, 0), "rsh");
+        assert_eq!(expand_vars("${2}", &mut vars, &pos, 0), "b");
+    }
+
+    #[test]
+    fn test_arithmetic_positional() {
+        let positionals = ["3".to_string(), "4".to_string()];
+        let mut vars = HashMap::new();
+        // Inside $(( ... )), `$1`/`$2` resolve from positional parameters.
+        assert_eq!(
+            expand_vars("$(( $1 + $2 ))", &mut vars, &positionals, 0),
+            "7"
+        );
+    }
+
+    #[test]
+    fn test_field_splitting_unmarked() {
+        assert_eq!(split_fields("a b c"), vec!["a", "b", "c"]);
+        assert_eq!(split_fields("  a  b  "), vec!["a", "b"]); // trimmed
+    }
+
+    #[test]
+    fn test_field_splitting_protected() {
+        // A MARK-ed space comes from quotes and must stay inside the field.
+        let protected = format!("a{} b", MARK);
+        assert_eq!(split_fields(&protected), vec!["a b"]);
+    }
+
+    #[test]
+    fn test_field_splitting_dollar_at() {
+        // Unquoted `$@` expands to one field per positional parameter.
+        let mut vars = HashMap::new();
+        let pos = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut subst = |_: &str| String::new();
+        let fields = expand_args(&["$@".to_string()], &mut vars, &pos, 0, &mut subst);
+        assert_eq!(fields, vec!["a", "b", "c"]);
     }
 }

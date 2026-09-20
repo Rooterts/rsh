@@ -4,6 +4,9 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use crate::builtins::{BuiltinResult, ShellState, run_builtin};
 use crate::expand::expand_args;
 use crate::parser::{
@@ -44,6 +47,7 @@ fn run_unit(unit: &Unit, state: &mut ShellState) -> Result<i32, RunError> {
     match unit {
         Unit::Pipeline(p) => run_pipeline(p, state),
         Unit::Compound(c) => run_compound(c, state),
+        Unit::Group(jobs) => run_jobs_inline(jobs, state),
     }
 }
 
@@ -63,6 +67,11 @@ fn run_compound(cmd: &CompoundCommand, state: &mut ShellState) -> Result<i32, Ru
         CompoundCommand::For { var, words, body } => run_for(var, words, body, state),
         CompoundCommand::While { cond, body, until } => run_while(cond, body, *until, state),
         CompoundCommand::Case { word, arms } => run_case(word, arms, state),
+        CompoundCommand::FunctionDef { name, body } => {
+            // Definitions only register the body; they never run it here.
+            state.functions.insert(name.clone(), body.clone());
+            Ok(0)
+        }
     }
 }
 
@@ -186,7 +195,7 @@ fn apply_assignments(assigns: &[(String, String)], state: &mut ShellState) {
 }
 
 fn run_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<i32, RunError> {
-    if pipeline.commands.len() == 1 && !pipeline.background {
+    if pipeline.commands.len() == 1 {
         let cmd = resolve_alias(&pipeline.commands[0], state);
         let expanded = expand_current(&cmd.args, state);
 
@@ -204,11 +213,30 @@ fn run_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<i32, RunE
         if crate::builtins::is_builtin(&words[0]) {
             // TP simplification: builtins only support stdout redirection
             // (>, >>), not stdin. Putting them in the middle of a real pipe
-            // would require manual fork() — see README.
+            // would require manual fork() — see README. Builtins run in the
+            // foreground; the `&` is simply ignored for them.
             return run_builtin_with_redirects(&words, &cmd.redirects, state);
         }
 
-        return run_external_single(&words, &cmd.redirects, &assigns);
+        // A shell function takes precedence over an external binary.
+        if let Some(body) = state.functions.get(&words[0]).cloned() {
+            let args = words[1..].to_vec();
+            let saved = std::mem::take(&mut state.positional);
+            state.positional = args;
+            let result = run_jobs_inline(&body, state);
+            state.positional = saved;
+            return result;
+        }
+
+        let command = words.join(" ");
+        return run_external_single(
+            &words,
+            &cmd.redirects,
+            &assigns,
+            pipeline.background,
+            &command,
+            state,
+        );
     }
 
     run_external_pipeline(pipeline, state)
@@ -219,6 +247,8 @@ fn run_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<i32, RunE
 fn expand_current(args: &[String], state: &mut ShellState) -> Vec<String> {
     let vars_snapshot = state.vars.clone();
     let aliases_snapshot = state.aliases.clone();
+    let functions_snapshot = state.functions.clone();
+    let positional_snapshot = state.positional.clone();
     let status_snapshot = state.last_status;
     let prev_dir_snapshot = state.prev_dir.clone();
 
@@ -227,12 +257,20 @@ fn expand_current(args: &[String], state: &mut ShellState) -> Vec<String> {
             cmd,
             &vars_snapshot,
             &aliases_snapshot,
+            &functions_snapshot,
+            &positional_snapshot,
             status_snapshot,
             &prev_dir_snapshot,
         )
     };
 
-    expand_args(args, &mut state.vars, state.last_status, &mut subst)
+    expand_args(
+        args,
+        &mut state.vars,
+        &state.positional,
+        state.last_status,
+        &mut subst,
+    )
 }
 
 /// Runs the contents of a `$(...)` in a "sub-state" that starts as a copy of
@@ -244,6 +282,8 @@ fn capture_subshell(
     input: &str,
     vars: &HashMap<String, String>,
     aliases: &HashMap<String, String>,
+    functions: &HashMap<String, Vec<Job>>,
+    positional: &[String],
     last_status: i32,
     prev_dir: &Option<String>,
 ) -> String {
@@ -265,8 +305,12 @@ fn capture_subshell(
     let mut child_state = ShellState {
         vars: vars.clone(),
         aliases: aliases.clone(),
+        functions: functions.clone(),
+        positional: positional.to_vec(),
         last_status,
         prev_dir: prev_dir.clone(),
+        jobs: Vec::new(),
+        next_job_id: 1,
     };
 
     #[cfg(unix)]
@@ -396,6 +440,9 @@ fn run_external_single(
     args: &[String],
     redirects: &[Redirect],
     envs: &[(String, String)],
+    background: bool,
+    command: &str,
+    state: &mut ShellState,
 ) -> Result<i32, RunError> {
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..]);
@@ -404,10 +451,54 @@ fn run_external_single(
     }
     apply_redirects(&mut cmd, redirects, Stdio::inherit(), Stdio::inherit());
 
+    // Give every spawned child its own process group and the right signal
+    // dispositions (all async-signal-safe, so it is safe in pre_exec).
+    #[cfg(unix)]
+    {
+        if background {
+            cmd.stdin(Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    crate::jobctl::background_child_setup();
+                    Ok(())
+                });
+            }
+        } else {
+            unsafe {
+                cmd.pre_exec(|| {
+                    crate::jobctl::foreground_child_setup();
+                    Ok(())
+                });
+            }
+        }
+    }
+
     match cmd.spawn() {
-        Ok(mut child) => {
-            let status = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-            Ok(status)
+        Ok(child) => {
+            let pid = child.id() as i32;
+
+            if background {
+                crate::jobctl::set_group(pid);
+                let id = state.add_job(command.to_string(), pid);
+                println!("[{}] {}", id, pid);
+                return Ok(0);
+            }
+
+            // Foreground: give the child the terminal and block until it
+            // finishes, or is stopped with ^Z (in which case it becomes a job).
+            crate::jobctl::set_group(pid);
+            crate::jobctl::give_terminal(pid);
+            match crate::jobctl::wait_foreground(pid) {
+                crate::jobctl::FgOutcome::Exited(code) => {
+                    crate::jobctl::release_terminal();
+                    Ok(code)
+                }
+                crate::jobctl::FgOutcome::Stopped => {
+                    crate::jobctl::release_terminal();
+                    state.add_stopped_job(command.to_string(), pid);
+                    Ok(0)
+                }
+            }
         }
         Err(e) => {
             eprintln!("rsh: {}: {}", args[0], e);
@@ -465,6 +556,14 @@ fn apply_redirects(
 
 fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<i32, RunError> {
     let n = pipeline.commands.len();
+    let background = pipeline.background;
+    // A human-readable label for the job table (only needed for background).
+    let label = pipeline
+        .commands
+        .iter()
+        .flat_map(|c| c.args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" | ");
     let mut children: Vec<Child> = Vec::with_capacity(n);
     let mut prev_stdout: Option<Stdio> = None;
 
@@ -495,6 +594,17 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
 
         apply_redirects(&mut command, &resolved.redirects, stdin, stdout);
 
+        if background {
+            command.stdin(Stdio::null());
+            #[cfg(unix)]
+            unsafe {
+                command.pre_exec(|| {
+                    crate::jobctl::background_child_setup();
+                    Ok(())
+                });
+            }
+        }
+
         match command.spawn() {
             Ok(mut child) => {
                 if !is_last {
@@ -509,9 +619,12 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
         }
     }
 
-    if pipeline.background {
+    if background {
         if let Some(last) = children.last() {
-            println!("[bg] pid {}", last.id());
+            let pid = last.id() as i32;
+            crate::jobctl::set_group(pid);
+            let id = state.add_job(label, pid);
+            println!("[{}] {}", id, pid);
         }
         return Ok(0);
     }

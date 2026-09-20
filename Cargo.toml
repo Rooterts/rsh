@@ -8,6 +8,9 @@ edition = "2024"
 # features pull in extra crates (completion trie, home dirs) that rsh does not use.
 rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
 glob = "0.3"
+# Used solely for job control (process groups, signals, waitpid). It is a thin,
+# standard, dependency-light wrapper around the platform C library.
+libc = "0.2"
 
 [[bin]]
 name = "rsh"

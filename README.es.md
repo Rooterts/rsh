@@ -32,12 +32,15 @@ cargo test
 
 ```
 src/
-  main.rs       -> loop principal (rustyline: historial + edición de línea)
+  main.rs       -> loop principal (rustyline): prompt + autocompletado con Tab
   tokenizer.rs  -> texto crudo -> tokens (comillas, escapes, comentarios)
-  parser.rs     -> tokens -> Jobs (pipelines conectados por && || ;)
-  expand.rs     -> expansión de $VAR, ${VAR}, $?, ~, y globs (*.txt)
-  builtins.rs   -> cd, pwd, exit, export, unset, echo, alias, unalias, which/type
-  executor.rs   -> ejecuta pipelines, aplica redirects, respeta &&/||/;/&
+  parser.rs     -> tokens -> Jobs (pipelines unidos por && || ; , grupos, funciones)
+  expand.rs     -> expansión de $VAR, ${VAR}, $?, $(...), $((...)), ~, globs, split por IFS
+  builtins.rs   -> cd, pwd, exit, export, unset, echo, alias, unalias, which/type,
+                   test/[, jobs, fg, bg — más el estado de la shell (vars, funciones,
+                   params posicionales, tabla de jobs)
+  executor.rs   -> corre pipelines, aplica redirects, respeta &&/||/;/&, job control
+  jobctl.rs     -> grupos de procesos, control de la terminal y señales (^C/^Z), waitpid
 ```
 
 ## Features implementadas
@@ -65,15 +68,36 @@ src/
   (además asigna), `${VAR:?mensaje}` (error si no está seteada), `${VAR:+alt}`,
   `${#VAR}` (longitud).
 - Código de salida como `$?` (funciona dentro y fuera de comillas dobles).
+- **Expansión aritmética**: `$(( 1 + 2 * 3 ))` con `+ - * / %`, paréntesis,
+  signo unario y referencias a variables (`$n`, `n`, `$1`...). Es el bloque
+  natural para loops tipo contador.
+- **Field splitting**: el resultado sin comillas de `$VAR`, `$(cmd)`, `$@` y la
+  aritmética se parte en varias palabras según el espacio (comportamiento IFS).
+  El espacio que viene entre comillas se conserva dentro de una misma palabra.
 - Expansión de `~` y de globs (`*.txt`, `?`, `[...]`).
 - Alias: `alias ll='ls -la'`, `unalias`.
 - `which` / `type` para saber si un comando es builtin o binario externo.
+- **Funciones de shell y parámetros posicionales**: `name() { ... ; }` con `$1`,
+  `$2`, ..., `$0`, `$#`, `$@`. Las funciones se pueden llamar recursivamente y
+  también están disponibles dentro de `$(...)`.
+- **`test` / `[` como builtin**: unarios (`-z`, `-n`, `-f`, `-d`, `-r`, `-w`,
+  `-x`), binarios (`=`, `!=`, `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`) y
+  negación con `!`.
 - **Estructuras de control**: `if/then/elif/else/fi`,
   `for VAR in ...; do ... done`, `while ... do ... done`,
   `until ... do ... done`, `case ... in patrón) ... ;; esac` (los patrones de
-  `case` soportan `*`, `?`, `[...]` igual que un glob).
-- Ctrl+C cancela la línea actual sin cerrar la shell; Ctrl+D la cierra (igual
-  que bash).
+  `case` soportan `*`, `?`, `[...]` igual que un glob). Grupos con `{ ...; }`.
+- **Job control**: los jobs en background con `&` se rastrean en una tabla;
+  `jobs` los lista, `fg %N` trae uno a primer plano y `bg %N` reanuda uno
+  detenido en background.
+- **Autocompletado con Tab** de nombres de comandos y rutas de archivos
+  (`rustyline::Helper`).
+- **Manejo de señales fino**: cada comando en primer plano corre en su propio
+  grupo de procesos y recibe la terminal, así Ctrl+C interrumpe solo el comando
+  y Ctrl+Z lo suspende (pasa a ser un job que puedes `fg`/`bg`). La shell
+  sobrevive a ambos.
+- Ctrl+C en el prompt cancela la línea sin cerrar la shell; Ctrl+D la cierra
+  (igual que bash).
 
 Ejemplos que ya funcionan:
 
@@ -93,44 +117,43 @@ false
 echo "el código fue $?"       # $? se expande también en comillas dobles
 
 v=$(echo sub) ; echo "v=$v"   # sustitución de comandos en una variable
-```
 
-> Nota: `[ ... ]` todavía no es un builtin — normalmente es el binario externo
-> `/usr/bin/[` o `/usr/bin/test`, así que en Linux suele funcionar tal cual.
-> Si tu sistema no lo tiene, `if`/`while` van a fallar con "comando no
-> encontrado" hasta que agreguemos `test`/`[` como builtin.
+fact() { if [ "$1" -le 1 ]; then echo 1;
+         else r=$(fact $(($1 - 1))); echo $(($1 * r)); fi }
+echo "fact 5 = $(fact 5)"     # funciones + recursión + aritmética
+
+sleep 5 &
+jobs            # [ 1] Running  sleep 5
+fg %1           # lo vuelve a primer plano
+```
 
 ## Limitaciones conocidas (documentadas a propósito)
 
-- **`test`/`[` no es builtin todavía** — depende de que exista como binario
-  externo en el sistema (habitual en Linux/macOS). Es un buen próximo paso.
-- **Sin field splitting real**: en bash, el resultado sin comillas de `$VAR`
-  o `$(cmd)` se separa en varias palabras según `IFS`. Acá cada `$VAR` sigue
-  siendo una sola palabra (aunque el `$(cmd)` de un pipeline sí puede generar
-  varios argumentos vía glob). Es la brecha más grande que queda vs. POSIX.
 - **Los comandos compuestos no pueden ir en un pipe** (ej. `if ...; fi | cat`)
   ni backgroundearse con `&` — son unidades aparte de las pipelines simples.
-- **Sin funciones de shell** ni parámetros posicionales (`$1`, `$@`, `$#`).
-- **Sin expansión aritmética** `$((1 + 2))` real (se necesita para loops
-  tipo contador con `while`).
 - **Los builtins dentro de un pipe** (ej. `export FOO=1 | cat`) no están
-  soportados — solo corren "solos" o al final de `&&`/`;`. Meterlos en medio
-  de un pipe real requeriría `fork()` manual en vez de
-  `std::process::Command`.
+  soportados — solo corren "solos", al final de `&&`/`;`, o con redirección de
+  stdout (`>`/`>>`). Meterlos en medio de un pipe real requeriría `fork()`
+  manual en vez de `std::process::Command`.
+- **Las pipelines no tienen job control por etapa**: solo un comando simple en
+  primer plano tiene grupo de procesos propio y manejo de ^C/^Z. Una pipeline
+  en primer plano, y sus etapas intermedias, corren en el grupo de la shell.
 - El **balanceo de paréntesis de `$(...)` es ingenuo**: no distingue paréntesis
   que aparecen dentro de comillas anidadas en el propio `$(...)`.
-- Los jobs en background **no tienen tabla de jobs** (`jobs`, `fg`, `bg`) ni
-  notificación al terminar.
+- `fg %N` / `bg %N` admiten el id (`fg 1`) además de la forma `%N`; los
+  especificadores `%+`/`%-` no están soportados.
+- Los jobs en background se reciclan recién cuando corres `jobs` o los traes a
+  primer plano, por lo que un job terminado queda como zombie hasta entonces en
+  vez de anunciarse en el prompt.
 
 ## Próximos pasos sugeridos (roadmap)
 
-1. `test` / `[` como builtin (o confirmar que el del sistema alcanza).
-2. Expansión aritmética `$((...))` — hace mucho más útiles los `while`.
-3. Funciones de shell y parámetros posicionales (`$1`, `$@`, `$#`, `$0`).
-4. Field splitting real por `IFS`.
-5. Tabla de jobs real (`jobs`, `fg %1`, `bg %1`).
-6. Autocompletado de rutas/comandos con `rustyline::Helper`.
-7. Manejo de señales más fino (que `Ctrl+Z` suspenda el proceso hijo).
+1. Comportamiento completo de `case`/`esac` y más casos límite de control de flujo.
+2. Job control por etapa en pipelines (cada etapa en su grupo de procesos).
+3. Notificaciones asíncronas "Done" para jobs en background (un handler de
+   `SIGCHLD`).
+4. Especificadores `%+`/`%-`, `wait`, `disown` y `kill` como builtins.
+5. Builtin `read` estilo POSIX y here-documents (`<<`).
 
 ## Licencia
 

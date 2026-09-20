@@ -103,6 +103,7 @@ name = "rsh"
 version = "0.1.0"
 dependencies = [
  "glob",
+ "libc",
  "rustyline",
 ]
 

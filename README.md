@@ -31,12 +31,15 @@ cargo test
 
 ```
 src/
-  main.rs       -> main loop (rustyline: history + line editing)
+  main.rs       -> main loop (rustyline): prompt + tab-completer helper
   tokenizer.rs  -> raw text -> tokens (quotes, escapes, comments)
-  parser.rs     -> tokens -> Jobs (pipelines joined by && || ;)
-  expand.rs     -> expansion of $VAR, ${VAR}, $?, ~, and globs (*.txt)
-  builtins.rs   -> cd, pwd, exit, export, unset, echo, alias, unalias, which/type
-  executor.rs   -> runs pipelines, applies redirects, honors &&/||/;/&
+  parser.rs     -> tokens -> Jobs (pipelines joined by && || ;, groups, functions)
+  expand.rs     -> expansion of $VAR, ${VAR}, $?, $(...), $((...)), ~, globs, IFS split
+  builtins.rs   -> cd, pwd, exit, export, unset, echo, alias, unalias, which/type,
+                   test/[, jobs, fg, bg — plus the shell state (vars, functions,
+                   positional params, job table)
+  executor.rs   -> runs pipelines, applies redirects, honors &&/||/;/&, job control
+  jobctl.rs     -> process groups, terminal control and signals (^C/^Z), waitpid
 ```
 
 ## Implemented features
@@ -64,15 +67,34 @@ src/
   (also assigns), `${VAR:?message}` (error if unset), `${VAR:+alt}`,
   `${#VAR}` (length).
 - Exit code accessible as `$?` (works both inside and outside double quotes).
+- **Arithmetic expansion**: `$(( 1 + 2 * 3 ))` with `+ - * / %`, parentheses,
+  unary signs and variable references (`$n`, `n`, `$1`...). It is the natural
+  building block for counter loops.
+- **Field splitting**: the unquoted result of `$VAR`, `$(cmd)`, `$@` and
+  arithmetic is split into separate words on whitespace (IFS behavior).
+  Quoted whitespace is preserved inside a single word.
 - `~` and glob expansion (`*.txt`, `?`, `[...]`).
 - Aliases: `alias ll='ls -la'`, `unalias`.
 - `which` / `type` to tell whether a command is a builtin or an external binary.
+- **Shell functions and positional parameters**: `name() { ... ; }` with `$1`,
+  `$2`, ..., `$0`, `$#`, `$@`. Functions are callable recursively and are also
+  available inside `$(...)`.
+- **`test` / `[` as a builtin**: unary (`-z`, `-n`, `-f`, `-d`, `-r`, `-w`, `-x`),
+  binary (`=`, `!=`, `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`) and `!` negation.
 - **Control structures**: `if/then/elif/else/fi`,
   `for VAR in ...; do ... done`, `while ... do ... done`,
   `until ... do ... done`, `case ... in pattern) ... ;; esac` (`case` patterns
-  support `*`, `?`, `[...]` just like a glob).
-- Ctrl+C cancels the current line without closing the shell; Ctrl+D closes it
-  (like bash).
+  support `*`, `?`, `[...]` just like a glob). `{ ...; }` command groups.
+- **Job control**: background jobs with `&` are tracked in a job table;
+  `jobs` lists them, `fg %N` brings one to the foreground and `bg %N`
+  resumes a stopped job in the background.
+- **Tab completion** for command names and file paths (`rustyline::Helper`).
+- **Finer signal handling**: every foreground child runs in its own process
+  group and receives the terminal, so Ctrl+C interrupts only the command and
+  Ctrl+Z suspends it (it becomes a job you can `fg`/`bg`). The shell itself
+  survives both.
+- Ctrl+C at the prompt cancels the current line without closing the shell;
+  Ctrl+D closes it (like bash).
 
 Working examples:
 
@@ -92,43 +114,42 @@ false
 echo "exit code was $?"       # $? expands inside double quotes too
 
 v=$(echo sub) ; echo "v=$v"   # command substitution into a variable
-```
 
-> Note: `[ ... ]` is not implemented as a builtin yet — it is usually the
-> external `/usr/bin/[` or `/usr/bin/test`, so on Linux it generally works as
-> an external binary. If your system lacks it, `if`/`while` will fail with
-> "command not found" until we add `test`/`[` as a builtin.
+fact() { if [ "$1" -le 1 ]; then echo 1;
+         else r=$(fact $(($1 - 1))); echo $(($1 * r)); fi }
+echo "fact 5 = $(fact 5)"     # shell functions + recursion + arithmetic
+
+sleep 5 &
+jobs            # [ 1] Running  sleep 5
+fg %1           # bring it back to the foreground
+```
 
 ## Known limitations (documented on purpose)
 
-- **`test`/`[` is not a builtin yet** — relies on the system binary (normally
-  present on Linux/macOS). A good next step.
-- **No real field splitting**: in bash, the unquoted result of `$VAR` or
-  `$(cmd)` is split into multiple words according to `IFS`. Here each `$VAR`
-  stays a single word (a pipeline `$(cmd)` can still yield several arguments
-  via glob). This is the largest remaining gap vs. real POSIX.
 - **Compound commands cannot be piped** (e.g. `if ...; fi | cat`) nor run in
   the background with `&` — they are separate from simple pipelines.
-- **No shell functions** nor positional parameters (`$1`, `$@`, `$#`).
-- **No real arithmetic expansion** `$((1 + 2))` (needed for counter loops with
-  `while`).
 - **Builtins inside a pipe** (e.g. `export FOO=1 | cat`) are not supported —
-  they only run standalone or at the end of `&&`/`;`. Putting them mid-pipe
-  would require manual `fork()` instead of `std::process::Command`.
+  they only run standalone, at the end of `&&`/`;`, or with a stdout
+  redirection (`>`/`>>`). Putting them mid-pipe would require manual `fork()`
+  instead of `std::process::Command`.
+- **Pipe lines have no per-stage job control**: a single command (foreground)
+  is the only construct with its own process group and ^C/^Z handling. A
+  foreground pipeline, and its intermediate stages, run in the shell's group.
 - The **`$(...)` parenthesis balance is naive**: it does not distinguish
   parentheses that appear inside quotes nested within the `$(...)`.
-- Background jobs have **no job table** (`jobs`, `fg`, `bg`) nor
-  completion notifications.
+- `fg %N` / `bg %N` may be used with an id (`fg 1`) as well as the `%N` form;
+  `%+`/`%-` job specifiers are not supported.
+- Background jobs are reaped lazily (when you run `jobs` or bring them to the
+  foreground), so a finished background job stays as a zombie until then
+  instead of announcing itself on the prompt.
 
 ## Suggested next steps (a useful roadmap)
 
-1. `test` / `[` as a builtin (or confirm the system one is enough).
-2. Arithmetic expansion `$((...))` — makes `while` loops much more useful.
-3. Shell functions and positional parameters (`$1`, `$@`, `$#`, `$0`).
-4. Real field splitting by `IFS`.
-5. A real job table (`jobs`, `fg %1`, `bg %1`).
-6. Path/command completion with a `rustyline::Helper`.
-7. Finer signal handling (make Ctrl+Z suspend the child process).
+1. Full `case`/`esac` behavior and more control-flow edge cases.
+2. Multi-stage pipeline job control (each stage in its own process group).
+3. Asynchronous "Done" notifications for background jobs (a `SIGCHLD` handler).
+4. `%+`/`%-` job specifiers, `wait`, `disown` and `kill` as builtins.
+5. posix-style `read` builtin and here-documents (`<<`).
 
 ## License
 

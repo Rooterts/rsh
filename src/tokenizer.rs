@@ -7,7 +7,10 @@ pub enum Token {
     Or,                             // ||
     Semicolon,                      // ;
     CaseEnd,                        // ;;
+    LParen,                         // ( (function definition / grouping)
     RParen,                         // ) (closes a `case` pattern)
+    LBrace,                         // {
+    RBrace,                         // }
     Background,                     // &
 }
 
@@ -87,6 +90,21 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 i += 1;
                 continue;
             }
+            '(' => {
+                tokens.push(Token::LParen);
+                i += 1;
+                continue;
+            }
+            '{' => {
+                tokens.push(Token::LBrace);
+                i += 1;
+                continue;
+            }
+            '}' => {
+                tokens.push(Token::RBrace);
+                i += 1;
+                continue;
+            }
             '&' => {
                 tokens.push(Token::Background);
                 i += 1;
@@ -132,7 +150,7 @@ pub fn read_quoted_word(chars: &[char], i: &mut usize) -> Result<String, String>
     while *i < chars.len() {
         let c = chars[*i];
 
-        if c.is_whitespace() || "|&;<>#)".contains(c) {
+        if c.is_whitespace() || "|&;<>#)(".contains(c) {
             break;
         }
 
@@ -235,19 +253,21 @@ pub fn read_quoted_word(chars: &[char], i: &mut usize) -> Result<String, String>
     Ok(word)
 }
 
-/// Marks a character so it is NEVER expanded (neither $VAR, nor glob, nor ~).
-/// Used for single quotes and for `\c` escapes outside quotes.
+/// Marks a character so it is NEVER expanded (neither $VAR, nor glob, nor ~)
+/// and never split by IFS field splitting. Used for single quotes and for
+/// `\c` escapes outside quotes.
 fn push_literal(word: &mut String, c: char) {
-    if matches!(c, '$' | '*' | '?' | '[' | '~') {
+    if matches!(c, '$' | '*' | '?' | '[' | '~' | ' ' | '\t' | '\n') {
         word.push(MARK);
     }
     word.push(c);
 }
 
-/// Marks * ? [ ~ but leaves $ unmarked: double quotes allow parameter and
-/// command expansion but NOT pathname/tilde expansion.
+/// Marks * ? [ ~ and whitespace but leaves $ unmarked: double quotes allow
+/// parameter and command expansion but NOT pathname/tilde expansion, and the
+/// surrounding whitespace must survive field splitting.
 fn push_double_quoted(word: &mut String, c: char) {
-    if matches!(c, '*' | '?' | '[' | '~') {
+    if matches!(c, '*' | '?' | '[' | '~' | ' ' | '\t' | '\n') {
         word.push(MARK);
     }
     word.push(c);
@@ -269,12 +289,13 @@ mod tests {
     #[test]
     fn test_quotes() {
         let tokens = tokenize(r#"echo "hola mundo" 'chau mundo'"#).unwrap();
+        // Quoted whitespace is marked so it survives field splitting.
         assert_eq!(
             tokens,
             vec![
                 Token::Word("echo".into()),
-                Token::Word("hola mundo".into()),
-                Token::Word("chau mundo".into()),
+                Token::Word(format!("hola{} mundo", MARK)),
+                Token::Word(format!("chau{} mundo", MARK)),
             ]
         );
     }
