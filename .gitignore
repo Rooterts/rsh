@@ -1,0 +1,9 @@
+# Build artifacts
+/target
+
+# Editor swap files
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
