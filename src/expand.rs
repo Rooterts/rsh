@@ -19,11 +19,22 @@ pub fn expand_args(
     run_subst: &mut dyn FnMut(&str) -> String,
 ) -> Vec<String> {
     let mut expanded = Vec::new();
+    // POSIX: a word of the form NAME=value that appears before the command word
+    // is an assignment. Tilde, parameter, command and arithmetic expansion are
+    // applied to it, but NOT field splitting nor pathname (glob) expansion, so
+    // its value is kept as one word even if it contains whitespace.
+    let mut seen_command_word = false;
 
     for arg in args {
         let after_subst = expand_command_subst(arg, run_subst);
         let after_vars = expand_vars(&after_subst, shell_vars, positional, last_status);
         let after_tilde = expand_tilde(&after_vars);
+
+        if !seen_command_word && is_assignment_word(&after_tilde) {
+            expanded.push(strip_marks(&after_tilde));
+            continue;
+        }
+        seen_command_word = true;
 
         if has_unmarked_glob_char(&after_tilde) {
             let pattern = to_glob_pattern(&after_tilde);
@@ -52,6 +63,21 @@ pub fn expand_args(
     }
 
     expanded
+}
+
+/// Whether an expanded word is an assignment (`NAME=value`) with a valid name.
+fn is_assignment_word(s: &str) -> bool {
+    match s.split_once('=') {
+        Some((name, _)) => {
+            let mut chars = name.chars();
+            match chars.next() {
+                Some(c) if c.is_alphabetic() || c == '_' => {}
+                _ => return false,
+            }
+            chars.all(|c| c.is_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
 }
 
 /// Splits a (still MARK-ed) word into fields on runs of unmarked whitespace.
@@ -126,23 +152,23 @@ fn expand_command_subst(input: &str, run: &mut dyn FnMut(&str) -> String) -> Str
         }
 
         if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
-            let mut depth = 1;
-            let mut j = i + 2;
-            while j < chars.len() && depth > 0 {
-                match chars[j] {
-                    '(' => depth += 1,
-                    ')' => depth -= 1,
-                    _ => {}
+            // `$(( ... ))` is handled as arithmetic by expand_vars (see below);
+            // here we only treat the command-substitution case. The matching
+            // `)` is found with the same quote/escape-aware logic the
+            // tokenizer uses, so a paren inside quotes does not cut it short.
+            match crate::tokenizer::find_command_subst_end(&chars, i + 2) {
+                Some(j) => {
+                    let inner: String = chars[i + 2..j].iter().collect();
+                    let output = run(&inner);
+                    out.push_str(&mark_all_special(&output));
+                    i = j + 1;
                 }
-                if depth == 0 {
-                    break;
+                None => {
+                    // Unclosed: leave the text as-is to avoid panicking.
+                    out.push(chars[i]);
+                    i += 1;
                 }
-                j += 1;
             }
-            let inner: String = chars[i + 2..j].iter().collect();
-            let output = run(&inner);
-            out.push_str(&mark_all_special(&output));
-            i = j + 1;
             continue;
         }
 
@@ -760,5 +786,55 @@ mod tests {
         let mut subst = |_: &str| String::new();
         let fields = expand_args(&["$@".to_string()], &mut vars, &pos, 0, &mut subst);
         assert_eq!(fields, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_command_subst_quoted_paren_inner() {
+        // A `)` inside double quotes is part of the substitution, not its end.
+        let mut captured: Option<String> = None;
+        let out = expand_command_subst("$(echo \"hi) there\")", &mut |inner: &str| -> String {
+            captured = Some(inner.to_string());
+            "OK".to_string()
+        });
+        assert_eq!(captured.as_deref(), Some("echo \"hi) there\""));
+        assert_eq!(out, "OK");
+    }
+
+    #[test]
+    fn test_assignment_value_not_field_split() {
+        // An assignment's RHS is not field-split, even with whitespace.
+        let mut vars = HashMap::new();
+        let mut subst = |_: &str| -> String { "a b c".to_string() };
+        let out = expand_args(&["v=$(x)".to_string()], &mut vars, &[], 0, &mut subst);
+        assert_eq!(out, vec!["v=a b c"]);
+    }
+
+    #[test]
+    fn test_command_arg_is_field_split() {
+        // A normal argument IS field-split after an unquoted expansion.
+        let mut vars = HashMap::new();
+        let mut subst = |_: &str| -> String { "b c".to_string() };
+        let out = expand_args(&["a $(x)".to_string()], &mut vars, &[], 0, &mut subst);
+        assert_eq!(out, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_assignment_glob_not_expanded() {
+        // Pathname expansion is not performed on an assignment's value.
+        let mut vars = HashMap::new();
+        let mut subst = |_: &str| -> String { String::new() };
+        let out = expand_args(&["g=*err*".to_string()], &mut vars, &[], 0, &mut subst);
+        assert_eq!(out, vec!["g=*err*"]);
+    }
+
+    #[test]
+    fn test_is_assignment_word() {
+        assert!(is_assignment_word("VAR=1"));
+        assert!(is_assignment_word("_x=hello"));
+        assert!(is_assignment_word("A="));
+        assert!(!is_assignment_word("not assignment"));
+        assert!(!is_assignment_word("1BAD=x"));
+        assert!(!is_assignment_word("noequals"));
+        assert!(!is_assignment_word("=value"));
     }
 }

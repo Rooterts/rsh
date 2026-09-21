@@ -71,7 +71,7 @@ impl ShellState {
 
 const BUILTIN_NAMES: &[&str] = &[
     "cd", "pwd", "exit", "export", "unset", "echo", "alias", "unalias", "which", "type", "test",
-    "[", "jobs", "fg", "bg",
+    "[", "jobs", "fg", "bg", "wait", "disown", "kill", "read",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -98,9 +98,13 @@ pub fn run_builtin(args: &[String], state: &mut ShellState) -> Option<BuiltinRes
         "unalias" => builtin_unalias(args, state),
         "which" | "type" => builtin_which(args, state),
         "test" | "[" => builtin_test(args),
-        "jobs" => builtin_jobs(state),
+        "jobs" => builtin_jobs(args, state),
         "fg" => builtin_fg(args, state),
         "bg" => builtin_bg(args, state),
+        "wait" => builtin_wait(args, state),
+        "disown" => builtin_disown(args, state),
+        "kill" => builtin_kill(args, state),
+        "read" => builtin_read(args, state),
         _ => 1,
     };
 
@@ -268,10 +272,63 @@ fn int_cmp(a: &str, b: &str, ord: std::cmp::Ordering) -> bool {
     }
 }
 
+/// Resolves a job specifier to its index in the job table.
+///
+/// Accepts `%+`/`%%` (most recent), `%-` (second most recent), `%N`/`N`
+/// (by job id) and a raw PID. With `None` it defaults to the most recent job.
+fn resolve_job(state: &ShellState, arg: Option<&str>) -> Option<usize> {
+    let pick_latest = |n: usize| {
+        if state.jobs.len() >= n {
+            Some(state.jobs.len() - n)
+        } else {
+            None
+        }
+    };
+
+    let by_id = |id: usize| state.jobs.iter().position(|j| j.id == id);
+    let by_pid = |pid: i32| state.jobs.iter().position(|j| j.pid == pid);
+
+    let Some(s) = arg else {
+        return pick_latest(1);
+    };
+    let s = s.trim();
+
+    if let Some(end) = s.strip_prefix('%') {
+        match end {
+            "+" | "%" | "" => return pick_latest(1),
+            "-" => return pick_latest(2),
+            _ => {}
+        }
+        if let Ok(id) = end.parse::<usize>() {
+            return by_id(id).or_else(|| by_pid(id as i32));
+        }
+        return None;
+    }
+
+    if let Ok(id) = s.parse::<usize>() {
+        if let Some(i) = by_id(id) {
+            return Some(i);
+        }
+        return by_pid(id as i32);
+    }
+
+    by_pid(s.parse::<i32>().ok()?)
+}
+
+/// Resolves a specifier (`%...` or a bare PID) to a tracked job's PID.
+fn resolve_pid(state: &ShellState, arg: &str) -> Option<i32> {
+    if arg.starts_with('%') {
+        resolve_job(state, Some(arg)).map(|i| state.jobs[i].pid)
+    } else {
+        arg.parse::<i32>().ok()
+    }
+}
+
 /// Implements `jobs`: lists the current job table, reaping and dropping any
-/// background process that has already finished. Accepts `-l` / `-p` style
-/// flags, which are parsed but only affect the prefix (matching common shells).
-fn builtin_jobs(state: &mut ShellState) -> i32 {
+/// background process that has already finished. Accepts `-l` / `-p` flags
+/// which change the prefix (matching common shells).
+fn builtin_jobs(args: &[String], state: &mut ShellState) -> i32 {
+    let _ = args;
     let mut i = 0;
     while i < state.jobs.len() {
         let job = &state.jobs[i];
@@ -292,28 +349,14 @@ fn builtin_jobs(state: &mut ShellState) -> i32 {
     0
 }
 
-/// Parses a `%N` job argument (or a bare `N`) into a job id.
-fn parse_job_arg(arg: Option<&String>) -> Option<usize> {
-    let s = arg?.trim();
-    s.strip_prefix('%').unwrap_or(s).parse::<usize>().ok()
-}
-
-/// Finds a job by id, returning its index in the table.
-fn find_job(state: &ShellState, id: usize) -> Option<usize> {
-    state.jobs.iter().position(|j| j.id == id)
-}
-
 /// Implements `fg [%N]`: brings a (stopped or running) job to the foreground,
 /// resuming it with SIGCONT and waiting for it to finish/stop again. With no
 /// argument it uses the most recent job.
 fn builtin_fg(args: &[String], state: &mut ShellState) -> i32 {
-    let id =
-        parse_job_arg(args.get(1)).unwrap_or_else(|| state.jobs.last().map(|j| j.id).unwrap_or(0));
-
-    let idx = match find_job(state, id) {
+    let idx = match resolve_job(state, args.get(1).map(|s| s.as_str())) {
         Some(i) => i,
         None => {
-            eprintln!("fg: no such job {}", id);
+            eprintln!("fg: no such job");
             return 1;
         }
     };
@@ -345,22 +388,215 @@ fn builtin_fg(args: &[String], state: &mut ShellState) -> i32 {
 /// Implements `bg [%N]`: sends SIGCONT to a stopped job so it keeps running in
 /// the background. With no argument it uses the most recent job.
 fn builtin_bg(args: &[String], state: &mut ShellState) -> i32 {
-    let id =
-        parse_job_arg(args.get(1)).unwrap_or_else(|| state.jobs.last().map(|j| j.id).unwrap_or(0));
-
-    let idx = match find_job(state, id) {
+    let idx = match resolve_job(state, args.get(1).map(|s| s.as_str())) {
         Some(i) => i,
         None => {
-            eprintln!("bg: no such job {}", id);
+            eprintln!("bg: no such job");
             return 1;
         }
     };
 
     state.jobs[idx].stopped = false;
-    let (pid, command) = (state.jobs[idx].pid, state.jobs[idx].command.clone());
+    let (id, pid, command) = {
+        let j = &state.jobs[idx];
+        (j.id, j.pid, j.command.clone())
+    };
     println!("[{}] {} &", id, command);
     crate::jobctl::continue_job(pid);
     0
+}
+
+/// Implements `wait [%N|pid ...]`: waits for background jobs to finish and
+/// returns their exit status. With no arguments it waits for all of them.
+fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
+    let mut status = state.last_status;
+    let mut handled: Vec<i32> = Vec::new();
+
+    if args.len() < 2 {
+        handled.extend(state.jobs.iter().map(|j| j.pid));
+    } else {
+        for spec in &args[1..] {
+            match resolve_pid(state, spec) {
+                Some(pid) => handled.push(pid),
+                None => {
+                    eprintln!("wait: {}: no such job", spec);
+                    return 127;
+                }
+            }
+        }
+    }
+
+    for &pid in &handled {
+        if let Some(code) = crate::jobctl::wait_blocking(pid) {
+            status = code;
+        }
+    }
+    // Drop the jobs we waited on from the table (they have been reaped).
+    state.jobs.retain(|j| !handled.contains(&j.pid));
+    status
+}
+
+/// Implements `disown [-h] [%N|pid ...]`: removes jobs from the job table so
+/// the shell stops tracking (and later reaping) them. With no arguments it
+/// disowns the most recent job.
+fn builtin_disown(args: &[String], state: &mut ShellState) -> i32 {
+    let mut targets: Vec<i32> = Vec::new();
+    if args.len() < 2 {
+        if let Some(job) = state.jobs.last() {
+            targets.push(job.pid);
+        }
+    } else {
+        for spec in &args[1..] {
+            if spec.starts_with('-') {
+                continue; // flags like -h are accepted but irrelevant here
+            }
+            if let Some(pid) = resolve_pid(state, spec) {
+                targets.push(pid);
+            }
+        }
+    }
+
+    state.jobs.retain(|j| !targets.contains(&j.pid));
+    0
+}
+
+/// Maps a signal name (optionally with a trailing digit) or number to a
+/// signal value.
+fn signal_from_name(s: &str) -> Option<i32> {
+    let upper = s.trim_start_matches("SIG").to_uppercase();
+    let v = match upper.as_str() {
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "KILL" => libc::SIGKILL,
+        "TERM" => libc::SIGTERM,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        "CONT" => libc::SIGCONT,
+        "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
+        "TTIN" => libc::SIGTTIN,
+        "TTOU" => libc::SIGTTOU,
+        "CHLD" => libc::SIGCHLD,
+        "PIPE" => libc::SIGPIPE,
+        _ => return s.parse::<i32>().ok(),
+    };
+    Some(v)
+}
+
+/// Implements `kill [-s SIG | -SIG] [pid|%job ...]`: sends a signal (SIGTERM
+/// by default) to a process or job.
+fn builtin_kill(args: &[String], state: &ShellState) -> i32 {
+    let mut sig = libc::SIGTERM;
+    let mut i = 1;
+
+    if args.len() < 2 {
+        eprintln!("kill: usage: kill [-s sig | -sig] pid ...");
+        return 2;
+    }
+
+    if let Some(spec) = args.get(1) {
+        if spec == "-s" {
+            sig = args
+                .get(2)
+                .and_then(|x| signal_from_name(x))
+                .unwrap_or(libc::SIGTERM);
+            i = 3;
+        } else if let Some(name) = spec.strip_prefix('-') {
+            // `-SIG` / `-9` style (also handles a lone `-`).
+            sig = if name.is_empty() {
+                libc::SIGTERM
+            } else {
+                signal_from_name(name).unwrap_or(libc::SIGTERM)
+            };
+            i = 2;
+        }
+    }
+
+    let mut failed = 0;
+    for spec in &args[i..] {
+        let pid = resolve_pid(state, spec).or_else(|| spec.parse::<i32>().ok());
+        match pid {
+            Some(pid) if crate::jobctl::kill_pid(pid, sig) => {}
+            _ => {
+                eprintln!("kill: {}: no such process or job", spec);
+                failed += 1;
+            }
+        }
+    }
+    if failed == 0 { 0 } else { 1 }
+}
+
+/// Implements `read [-r] [var ...]`: reads a line from standard input and
+/// assigns whitespace-separated fields to each variable (the last variable
+/// receives the rest of the line). Free variables default to `REPLY`. Without
+/// `-r`, backslashes would escape the next character; with `-r` they stay
+/// literal (the common, recommended mode). Returns 0 on success and 1 on EOF,
+/// which makes `while read x; do ... done` work naturally.
+fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
+    let mut raw = false;
+    let mut vars: Vec<String> = Vec::new();
+    for a in &args[1..] {
+        if a == "-r" {
+            raw = true;
+        } else if a.starts_with('-') {
+            // Other flags are not supported; ignore silently.
+        } else {
+            vars.push(a.clone());
+        }
+    }
+    if vars.is_empty() {
+        vars.push("REPLY".to_string());
+    }
+
+    use std::io::BufRead;
+    let mut buf = String::new();
+    let n = match std::io::stdin().lock().read_line(&mut buf) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("read: {}", e);
+            return 1;
+        }
+    };
+    if n == 0 {
+        return 1; // EOF
+    }
+    if !raw {
+        // A backslash escapes the following character (POSIX).
+        let mut out = String::with_capacity(buf.len());
+        let mut it = buf.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                if let Some(nc) = it.next() {
+                    out.push(nc);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        buf = out;
+    }
+    let line = buf.trim_end_matches(['\n', '\r']);
+
+    assign_read_fields(line, &vars, &mut state.vars);
+    0
+}
+
+/// Splits a (backslash-unescaped) line into fields and stores them in the
+/// shell variables: each non-last variable gets one whitespace-separated
+/// field and the last variable receives the rest of the line.
+fn assign_read_fields(line: &str, vars: &[String], map: &mut HashMap<String, String>) {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    for (i, var) in vars.iter().enumerate() {
+        if i == vars.len() - 1 {
+            let rest: Vec<&str> = fields.iter().skip(i).copied().collect();
+            map.insert(var.clone(), rest.join(" "));
+        } else if let Some(f) = fields.get(i) {
+            map.insert(var.clone(), f.to_string());
+        } else {
+            map.insert(var.clone(), String::new());
+        }
+    }
 }
 
 fn builtin_cd(args: &[String], state: &mut ShellState) -> i32 {
@@ -576,5 +812,53 @@ mod tests {
             "]".to_string(),
         ];
         assert_eq!(builtin_test(&args), 0);
+    }
+
+    #[test]
+    fn test_read_assign_fields() {
+        let mut m = HashMap::new();
+        let vars: Vec<String> = ["x", "y", "z"].iter().map(|s| s.to_string()).collect();
+        assign_read_fields("a b c d", &vars, &mut m);
+        assert_eq!(m.get("x"), Some(&"a".to_string()));
+        assert_eq!(m.get("y"), Some(&"b".to_string()));
+        // The last variable receives the rest of the line.
+        assert_eq!(m.get("z"), Some(&"c d".to_string()));
+    }
+
+    #[test]
+    fn test_read_assign_fields_missing() {
+        let mut m = HashMap::new();
+        let vars: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assign_read_fields("only", &vars, &mut m);
+        assert_eq!(m.get("a"), Some(&"only".to_string()));
+        assert_eq!(m.get("b"), Some(&String::new()));
+    }
+
+    #[test]
+    fn test_resolve_job_specifiers() {
+        let mut st = ShellState::new();
+        st.jobs.push(JobRecord {
+            id: 1,
+            pid: 100,
+            command: "one".into(),
+            stopped: false,
+        });
+        st.jobs.push(JobRecord {
+            id: 2,
+            pid: 200,
+            command: "two".into(),
+            stopped: false,
+        });
+
+        // %+ / default resolve to the most recent job (last in the table).
+        assert_eq!(resolve_job(&st, Some("%+")), Some(1));
+        assert_eq!(resolve_job(&st, None), Some(1));
+        // %- resolves to the second-most-recent.
+        assert_eq!(resolve_job(&st, Some("%-")), Some(0));
+        // %N and bare N resolve by job id; a bare number can also be a pid.
+        assert_eq!(resolve_job(&st, Some("%1")), Some(0));
+        assert_eq!(resolve_job(&st, Some("1")), Some(0));
+        assert_eq!(resolve_job(&st, Some("200")), Some(1));
+        assert_eq!(resolve_job(&st, Some("%9")), None);
     }
 }

@@ -87,7 +87,13 @@ src/
   support `*`, `?`, `[...]` just like a glob). `{ ...; }` command groups.
 - **Job control**: background jobs with `&` are tracked in a job table;
   `jobs` lists them, `fg %N` brings one to the foreground and `bg %N`
-  resumes a stopped job in the background.
+  resumes a stopped job in the background. `wait` blocks until jobs finish,
+  `disown` removes them from the table and `kill [-s sig]` sends signals.
+  Job specifiers `%+`/`%%` (most recent), `%-` (second most recent), `%N`
+  and a bare PID are accepted by `fg`/`bg`/`wait`/`disown`/`kill`.
+- **`read` builtin**: `read [-r] name1 name2 ...` parses a line from stdin
+  into variables (the last one receives the rest), so
+  `while read x; do ...; done` works.
 - **Tab completion** for command names and file paths (`rustyline::Helper`).
 - **Finer signal handling**: every foreground child runs in its own process
   group and receives the terminal, so Ctrl+C interrupts only the command and
@@ -135,21 +141,17 @@ fg %1           # bring it back to the foreground
 - **Pipe lines have no per-stage job control**: a single command (foreground)
   is the only construct with its own process group and ^C/^Z handling. A
   foreground pipeline, and its intermediate stages, run in the shell's group.
-- The **`$(...)` parenthesis balance is naive**: it does not distinguish
-  parentheses that appear inside quotes nested within the `$(...)`.
-- `fg %N` / `bg %N` may be used with an id (`fg 1`) as well as the `%N` form;
-  `%+`/`%-` job specifiers are not supported.
-- Background jobs are reaped lazily (when you run `jobs` or bring them to the
-  foreground), so a finished background job stays as a zombie until then
+- Background jobs are reaped lazily (when you run `jobs`, `wait` or bring them
+  to the foreground), so a finished background job stays as a zombie until then
   instead of announcing itself on the prompt.
 
 ## Suggested next steps (a useful roadmap)
 
-1. Full `case`/`esac` behavior and more control-flow edge cases.
-2. Multi-stage pipeline job control (each stage in its own process group).
-3. Asynchronous "Done" notifications for background jobs (a `SIGCHLD` handler).
-4. `%+`/`%-` job specifiers, `wait`, `disown` and `kill` as builtins.
-5. posix-style `read` builtin and here-documents (`<<`).
+1. Multi-stage pipeline job control (each stage in its own process group).
+2. Asynchronous "Done" notifications for background jobs (a `SIGCHLD` handler).
+3. Builtins running in the middle of a real pipe (manual `fork()`).
+4. Compound commands (`if`/`for`/`while`/functions) piped or backgrounded.
+5. Here-documents (`<<`).
 
 ## License
 

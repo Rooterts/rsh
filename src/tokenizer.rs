@@ -144,6 +144,57 @@ fn read_word(chars: &[char], i: &mut usize) -> Result<String, String> {
 /// characters indicating "this is literal, do not expand it" — interpreted
 /// later by expand.rs. Stops before an unquoted ')' or ';' so `case` can
 /// recognize the end of a pattern.
+/// Given `chars` and the index right after an opening `$(`, returns the index
+/// of the matching closing `)`. It honors single/double quotes and backslash
+/// escapes, so parentheses that appear inside quoted (or escaped) text do not
+/// prematurely close the block. Returns `None` if the block is never closed.
+pub fn find_command_subst_end(chars: &[char], mut j: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => {
+                j += 2; // skip the escaped character
+            }
+            '\'' => {
+                j += 1;
+                while j < chars.len() && chars[j] != '\'' {
+                    j += 1;
+                }
+                if j < chars.len() {
+                    j += 1; // skip the closing quote
+                }
+            }
+            '"' => {
+                j += 1;
+                while j < chars.len() {
+                    if chars[j] == '\\' && j + 1 < chars.len() {
+                        j += 2;
+                        continue;
+                    }
+                    if chars[j] == '"' {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            '(' => {
+                depth += 1;
+                j += 1;
+            }
+            ')' => {
+                depth -= 1;
+                j += 1;
+                if depth == 0 {
+                    return Some(j - 1);
+                }
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
 pub fn read_quoted_word(chars: &[char], i: &mut usize) -> Result<String, String> {
     let mut word = String::new();
 
@@ -213,27 +264,18 @@ pub fn read_quoted_word(chars: &[char], i: &mut usize) -> Result<String, String>
             }
             '$' if chars.get(*i + 1) == Some(&'(') => {
                 // Unquoted $(...): read the whole block honoring nested
-                // parentheses, so inner spaces do not cut the word short
+                // parentheses, quotes and escapes, so inner spaces do not cut
+                // the word short and a `)` inside quotes does not close it
                 // (its content is re-tokenized recursively when executed).
                 let start = *i;
-                *i += 2;
-                let mut depth = 1;
-                while *i < chars.len() && depth > 0 {
-                    match chars[*i] {
-                        '(' => depth += 1,
-                        ')' => depth -= 1,
-                        _ => {}
+                match find_command_subst_end(chars, *i + 2) {
+                    Some(end) => {
+                        *i = end + 1;
+                        let chunk: String = chars[start..*i].iter().collect();
+                        word.push_str(&chunk);
                     }
-                    *i += 1;
-                    if depth == 0 {
-                        break;
-                    }
+                    None => return Err("unclosed $(...)".to_string()),
                 }
-                if depth != 0 {
-                    return Err("unclosed $(...)".to_string());
-                }
-                let chunk: String = chars[start..*i].iter().collect();
-                word.push_str(&chunk);
             }
             '\\' => {
                 // Escape outside quotes: the following char is literal.
@@ -367,6 +409,42 @@ mod tests {
                 Token::Word("$(ls -la /tmp)".into())
             ]
         );
+    }
+
+    #[test]
+    fn test_command_subst_paren_inside_double_quote() {
+        // A `)` inside double quotes must not close the $(...) block.
+        let tokens = tokenize(r#"echo $(echo "hi) there")"#).unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word(r#"$(echo "hi) there")"#.into())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_command_subst_paren_inside_single_quote() {
+        // A `(` inside single quotes must not open a nested level.
+        let tokens = tokenize("echo $(echo 'a(b') extra").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("$(echo 'a(b')".into()),
+                Token::Word("extra".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_command_subst_end_nested() {
+        let chars: Vec<char> = "$(echo $(pwd) here)".chars().collect();
+        let end = find_command_subst_end(&chars, 2).unwrap();
+        assert_eq!(chars[end], ')');
+        let inner: String = chars[2..end].iter().collect();
+        assert_eq!(inner, "echo $(pwd) here");
     }
 
     #[test]

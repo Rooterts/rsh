@@ -125,6 +125,27 @@ pub fn try_reap(pid: i32) -> Option<i32> {
     }
 }
 
+/// Sends any signal to a process; returns whether the signal was delivered.
+pub fn kill_pid(pid: i32, sig: i32) -> bool {
+    unsafe { libc::kill(pid, sig as libc::c_int) == 0 }
+}
+
+/// Blocks until `pid` terminates and returns its exit status (or `128+signal`
+/// if it died from a signal). Returns `None` if `pid` is not a known child.
+pub fn wait_blocking(pid: i32) -> Option<i32> {
+    let mut status = 0;
+    loop {
+        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if ret == pid {
+            return Some(exit_status(status));
+        }
+        if ret < 0 {
+            return None;
+        }
+        // EINTR loop; keep waiting.
+    }
+}
+
 /// Blocks until `pid` terminates or stops. See [`FgOutcome`].
 pub fn wait_foreground(pid: i32) -> FgOutcome {
     ignore_sigint_on();

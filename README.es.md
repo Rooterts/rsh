@@ -89,7 +89,13 @@ src/
   `case` soportan `*`, `?`, `[...]` igual que un glob). Grupos con `{ ...; }`.
 - **Job control**: los jobs en background con `&` se rastrean en una tabla;
   `jobs` los lista, `fg %N` trae uno a primer plano y `bg %N` reanuda uno
-  detenido en background.
+  detenido en background. `wait` bloquea hasta que terminan, `disown` los quita
+  de la tabla y `kill [-s sig]` envía señales. Los especificadores de job
+  `%+`/`%%` (más reciente), `%-` (segundo más reciente), `%N` y un PID a secas
+  funcionan en `fg`/`bg`/`wait`/`disown`/`kill`.
+- **Builtin `read`**: `read [-r] nombre1 nombre2 ...` lee una línea del stdin y
+  la reparte en variables (la última se queda con el resto), así que funciona
+  `while read x; do ...; done`.
 - **Autocompletado con Tab** de nombres de comandos y rutas de archivos
   (`rustyline::Helper`).
 - **Manejo de señales fino**: cada comando en primer plano corre en su propio
@@ -138,22 +144,18 @@ fg %1           # lo vuelve a primer plano
 - **Las pipelines no tienen job control por etapa**: solo un comando simple en
   primer plano tiene grupo de procesos propio y manejo de ^C/^Z. Una pipeline
   en primer plano, y sus etapas intermedias, corren en el grupo de la shell.
-- El **balanceo de paréntesis de `$(...)` es ingenuo**: no distingue paréntesis
-  que aparecen dentro de comillas anidadas en el propio `$(...)`.
-- `fg %N` / `bg %N` admiten el id (`fg 1`) además de la forma `%N`; los
-  especificadores `%+`/`%-` no están soportados.
-- Los jobs en background se reciclan recién cuando corres `jobs` o los traes a
-  primer plano, por lo que un job terminado queda como zombie hasta entonces en
-  vez de anunciarse en el prompt.
+- Los jobs en background se reciclan recién cuando corres `jobs`, `wait` o los
+  traes a primer plano, por lo que un job terminado queda como zombie hasta
+  entonces en vez de anunciarse en el prompt.
 
 ## Próximos pasos sugeridos (roadmap)
 
-1. Comportamiento completo de `case`/`esac` y más casos límite de control de flujo.
-2. Job control por etapa en pipelines (cada etapa en su grupo de procesos).
-3. Notificaciones asíncronas "Done" para jobs en background (un handler de
+1. Job control por etapa en pipelines (cada etapa en su grupo de procesos).
+2. Notificaciones asíncronas "Done" para jobs en background (un handler de
    `SIGCHLD`).
-4. Especificadores `%+`/`%-`, `wait`, `disown` y `kill` como builtins.
-5. Builtin `read` estilo POSIX y here-documents (`<<`).
+3. Builtins corriendo en el medio de un pipe real (`fork()` manual).
+4. Comandos compuestos (`if`/`for`/`while`/funciones) en pipe o background.
+5. Here-documents (`<<`).
 
 ## Licencia
 
