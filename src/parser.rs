@@ -450,6 +450,10 @@ fn parse_pipeline(tokens: &[Token], mut i: usize) -> Result<(Pipeline, usize), S
         match tokens.get(i) {
             Some(Token::Pipe) => {
                 i += 1;
+                // Newlines (now `;` tokens) may follow a dangling pipe.
+                while matches!(tokens.get(i), Some(Token::Semicolon)) {
+                    i += 1;
+                }
                 continue;
             }
             Some(Token::Background) => {

@@ -39,6 +39,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     while i < chars.len() {
         let c = chars[i];
 
+        // A newline separates commands exactly like ';' (POSIX). Quotes,
+        // escapes and $(...) blocks containing newlines are consumed inside
+        // read_quoted_word, so this only sees unquoted newlines.
+        if c == '\n' {
+            tokens.push(Token::Semicolon);
+            i += 1;
+            continue;
+        }
+
         if c.is_whitespace() {
             i += 1;
             continue;

@@ -101,8 +101,12 @@ src/
   (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), so they
   no longer need an external binary of the same name.
 - **Here-documents**: `cat <<EOF` / `<<-` (tab-stripping) / `<<'EOF'`
-  (no expansion); bodies gather with a `> ` continuation prompt and feed any
-  command, pipeline stage or compound (`while read l; ...; done <<E`).
+  (no expansion); bodies expand `$VAR` and `$(cmd)`, gather with a `> `
+  continuation prompt, and feed any command, pipeline stage or compound
+  (`while read l; ...; done <<E`).
+- **Multi-line input (PS2)**: unfinished constructs (`if ...`, unclosed
+  quotes, dangling `|`, `$(...` spanning lines) keep reading with a `> `
+  prompt until they parse.
 - **Compound commands as pipeline stages**: `if/for/while/until/case`, `{ }`
   groups and `( )` subshells can be piped or backgrounded (`if ...; fi | cat`,
   `echo x | while read l; do ...; done`, `mycommand &`). A stage that is
@@ -148,12 +152,13 @@ fg %1           # bring it back to the foreground
 
 ## Known limitations (documented on purpose)
 
-- Heredoc bodies expand `$VAR`-style variables but not `$(command)` inside
-  them, and `$(...)` cannot span multiple physical lines.
+- `$0`/`$@`/`$#` positional parameters exist, but `shift`/`getopts`,
+  arithmetic `for ((...))` loops and `$(...)` *inside heredoc bodies* are not
+  implemented yet.
 
 ## Suggested next steps (a useful roadmap)
 
-1. `getopts`, arithmetic `for ((...))` and more POSIX edge cases.
+1. `getopts`/`shift` and arithmetic `for ((...))`.
 
 ## License
 

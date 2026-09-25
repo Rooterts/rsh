@@ -103,8 +103,11 @@ src/
   (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), así ya
   no hace falta que exista un binario externo del mismo nombre.
 - **Here-documents**: `cat <<EOF` / `<<-` (quita tabuladores) / `<<'EOF'`
-  (sin expansión); el cuerpo se pide con prompt `> ` y alimenta cualquier
-  comando, etapa de pipe o compuesto (`while read l; ...; done <<E`).
+  (sin expansión); el cuerpo expande `$VAR` y `$(cmd)`, se pide con prompt
+  `> ` y alimenta cualquier comando, etapa de pipe o compuesto.
+- **Entrada multi-línea (PS2)**: constructores sin cerrar (`if ...`, comillas
+  abiertas, `|` final, `$(...` en varias líneas) siguen leyendo con un prompt
+  `> ` hasta parsear.
 - **Comandos compuestos como etapas de pipe**: `if/for/while/until/case`,
   grupos `{ }` y subshells `( )` pueden pipearse o backgroundearse
   (`if ...; fi | cat`, `echo x | while read l; do ...; done`). Una etapa
@@ -151,12 +154,12 @@ fg %1           # lo vuelve a primer plano
 
 ## Limitaciones conocidas (documentadas a propósito)
 
-- Los here-documents expanden `$VAR` pero no `$(comando)` dentro del cuerpo, y
-  `$(...)` no puede abarcar varias líneas físicas.
+- Existen `$0`/`$@`/`$#`, pero `shift`/`getopts`, los bucles aritméticos
+  `for ((...))` y `$(...)` *dentro* de cuerpos de heredoc aún no están.
 
 ## Próximos pasos sugeridos (roadmap)
 
-1. `getopts`, `for ((...))` aritmético y más casos límite POSIX.
+1. `getopts`/`shift` y `for ((...))` aritmético.
 
 ## Licencia
 

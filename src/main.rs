@@ -181,58 +181,84 @@ fn main() {
 
         let prompt = build_prompt(&state);
 
-        let line_result: Result<String, ReadlineError> = if interactive {
-            rl.readline(&prompt)
-        } else {
-            // Match rustyline's piped behavior: echo the prompt, then read.
-            use std::io::Write;
-            print!("{}", prompt);
-            let _ = std::io::stdout().flush();
-            match read_line_stdin() {
-                Ok(l) => Ok(l),
-                Err(_) => Err(ReadlineError::Eof),
+        let first_line = match next_input_line(interactive, &mut rl, &prompt) {
+            Some(l) => l,
+            None => break, // Ctrl+D / EOF
+        };
+        if first_line.trim().is_empty() {
+            continue;
+        }
+
+        if interactive {
+            let _ = rl.add_history_entry(first_line.trim());
+        }
+
+        // Multi-line input: an incomplete command (open quote, `$(`, `|`,
+        // `if...` without `fi`, ...) keeps reading with the `> ` prompt, like
+        // any POSIX shell's PS2.
+        let mut input = first_line;
+        let jobs = loop {
+            let parsed = tokenizer::tokenize(&input).and_then(parser::parse);
+            match parsed {
+                Ok(jobs) => break Ok(jobs),
+                Err(e) if input_is_incomplete(&e) => {
+                    match next_input_line(interactive, &mut rl, "> ") {
+                        Some(l) => {
+                            input.push('\n');
+                            input.push_str(&l);
+                        }
+                        None => break Err(e), // EOF mid-construct
+                    }
+                }
+                Err(e) => break Err(e),
             }
         };
 
-        match line_result {
-            Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let _ = rl.add_history_entry(trimmed);
-
-                match tokenizer::tokenize(trimmed) {
-                    Ok(tokens) => match parser::parse(tokens) {
-                        Ok(mut jobs) => {
-                            // Gather heredoc bodies (lines up to each
-                            // delimiter) before running anything.
-                            let fill_ok = fill_heredocs(&mut jobs, &state, interactive, &mut rl);
-                            if fill_ok.is_ok()
-                                && let Some(code) = executor::run_jobs(&jobs, &mut state)
-                            {
-                                let _ = rl.save_history(&history_path);
-                                std::process::exit(code);
-                            }
-                        }
-                        Err(e) => eprintln!("rsh: syntax error: {}", e),
-                    },
-                    Err(e) => eprintln!("rsh: lexical error: {}", e),
+        match jobs {
+            Ok(mut jobs) => {
+                // Gather heredoc bodies (lines up to each delimiter) before
+                // running anything.
+                let fill_ok = fill_heredocs(&mut jobs, &state, interactive, &mut rl);
+                if fill_ok.is_ok()
+                    && let Some(code) = executor::run_jobs(&jobs, &mut state)
+                {
+                    let _ = rl.save_history(&history_path);
+                    std::process::exit(code);
                 }
             }
-            // Ctrl+C: like bash, cancel the current line instead of exiting.
-            Err(ReadlineError::Interrupted) => continue,
-            // Ctrl+D: exits the shell, as in bash.
-            Err(ReadlineError::Eof) => break,
-            Err(e) => {
-                eprintln!("rsh: error reading input: {}", e);
-                break;
-            }
+            Err(e) => eprintln!("rsh: syntax error: {}", e),
         }
     }
 
     let _ = rl.save_history(&history_path);
+}
+
+/// Reads one input line: via rustyline (line editing/history) when stdin is a
+/// terminal, otherwise byte-by-byte from fd 0 so nothing pre-reads lines meant
+/// for `read` or heredoc bodies. Returns None on EOF or Ctrl+C.
+fn next_input_line(
+    interactive: bool,
+    rl: &mut Editor<RshCompleter, DefaultHistory>,
+    prompt: &str,
+) -> Option<String> {
+    if interactive {
+        match rl.readline(prompt) {
+            Ok(l) => Some(l),
+            Err(_) => None,
+        }
+    } else {
+        use std::io::Write;
+        print!("{}", prompt);
+        let _ = std::io::stdout().flush();
+        read_line_stdin().ok()
+    }
+}
+
+/// Whether a lexing/parsing error likely means "the command continues on the
+/// next line" (unclosed quote/substitution, missing fi/done/esac, dangling
+/// operator), i.e. we should keep reading with the `> ` prompt.
+fn input_is_incomplete(err: &str) -> bool {
+    err.contains("unclosed") || err.contains("expected")
 }
 
 /// Feeds every heredoc redirect in the parsed jobs with its body: successive
@@ -274,19 +300,8 @@ fn fill_heredocs(
 
                 let mut body = String::new();
                 loop {
-                    let line_res: Result<String, ReadlineError> = if interactive {
-                        rl.readline("> ")
-                    } else {
-                        use std::io::Write;
-                        print!("> ");
-                        let _ = std::io::stdout().flush();
-                        match read_line_stdin() {
-                            Ok(l) => Ok(l),
-                            Err(_) => Err(ReadlineError::Eof),
-                        }
-                    };
-                    match line_res {
-                        Ok(line) => {
+                    match next_input_line(interactive, rl, "> ") {
+                        Some(line) => {
                             let line = if strip_tabs {
                                 line.trim_start_matches('\t').to_string()
                             } else {
@@ -298,7 +313,7 @@ fn fill_heredocs(
                             body.push_str(&line);
                             body.push('\n');
                         }
-                        Err(_) => {
+                        None => {
                             eprintln!(
                                 "rsh: warning: here-document delimited by end-of-file (wanted `{}`)",
                                 delim
