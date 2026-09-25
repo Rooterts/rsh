@@ -13,7 +13,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use crate::builtins::{BuiltinResult, ShellState, run_builtin};
 use crate::expand::expand_args;
 use crate::parser::{
-    CaseArm, CompoundCommand, Connector, IfChain, Job, Pipeline, Redirect, SimpleCommand, Unit,
+    CaseArm, CompoundCommand, Connector, IfChain, Job, Pipeline, PipelineStage, Redirect,
+    SimpleCommand, Unit,
 };
 use crate::tokenizer::RedirectKind;
 use crate::{parser, tokenizer};
@@ -50,7 +51,6 @@ fn run_unit(unit: &Unit, state: &mut ShellState) -> Result<i32, RunError> {
     match unit {
         Unit::Pipeline(p) => run_pipeline(p, state),
         Unit::Compound(c) => run_compound(c, state),
-        Unit::Group(jobs) => run_jobs_inline(jobs, state),
     }
 }
 
@@ -198,8 +198,23 @@ fn apply_assignments(assigns: &[(String, String)], state: &mut ShellState) {
 }
 
 fn run_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<i32, RunError> {
+    if pipeline.commands.len() == 1 && !pipeline.background {
+        // A single compound stage runs in-process (no pipe to satisfy), so
+        // loops/ifs can mutate shell state (variables, positional params...).
+        match &pipeline.commands[0] {
+            PipelineStage::Compound(c) => return run_compound(c, state),
+            PipelineStage::Group(jobs) => return run_jobs_inline(jobs, state),
+            PipelineStage::Subshell(_) => {} // always forked (subshelled)
+            PipelineStage::Simple(_) => {}
+        }
+    }
+
     if pipeline.commands.len() == 1 {
-        let cmd = resolve_alias(&pipeline.commands[0], state);
+        let PipelineStage::Simple(simple) = &pipeline.commands[0] else {
+            // backgrounded compound stage: handled via the pipeline runner
+            return run_external_pipeline(pipeline, state);
+        };
+        let cmd = resolve_alias(simple, state);
         let expanded = expand_current(&cmd.args, state);
 
         // POSIX: the command may start with `NAME=value` assignments. They
@@ -214,10 +229,9 @@ fn run_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<i32, RunE
         }
 
         if crate::builtins::is_builtin(&words[0]) {
-            // TP simplification: builtins only support stdout redirection
-            // (>, >>), not stdin. Putting them in the middle of a real pipe
-            // would require manual fork() — see README. Builtins run in the
-            // foreground; the `&` is simply ignored for them.
+            // A lone builtin runs in the current shell (no fork), with its
+            // redirects applied. Inside a pipe it runs in a forked stage —
+            // see run_external_pipeline.
             return run_builtin_with_redirects(&words, &cmd.redirects, state);
         }
 
@@ -565,7 +579,7 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
     let label = pipeline
         .commands
         .iter()
-        .map(|c| c.args.join(" "))
+        .map(stage_label)
         .collect::<Vec<_>>()
         .join(" | ");
 
@@ -577,7 +591,36 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
     let mut prev_in: Option<OwnedFd> = None;
 
     for (idx, cmd) in pipeline.commands.iter().enumerate() {
-        let resolved = resolve_alias(cmd, state);
+        let is_last = idx == n - 1;
+
+        // Compound stages (if/for/while/case, `{ ...; }`, `( ... )`) run in a
+        // forked subshell; any state changes inside stay local to it.
+        if !matches!(cmd, PipelineStage::Simple(_)) {
+            let body = match cmd {
+                PipelineStage::Compound(c) => ChildBody::Compound(c),
+                PipelineStage::Group(jobs) | PipelineStage::Subshell(jobs) => ChildBody::Jobs(jobs),
+                PipelineStage::Simple(_) => unreachable!(),
+            };
+            let (pid, next_in) =
+                match fork_stage(body, &[], state, prev_in.take(), is_last, pgid, background) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("rsh: pipeline stage: {}", e);
+                        return Ok(127);
+                    }
+                };
+            prev_in = next_in;
+            child_pids.push(pid);
+            if pgid.is_none() {
+                pgid = Some(pid);
+            }
+            continue;
+        }
+
+        let PipelineStage::Simple(simple) = cmd else {
+            continue;
+        };
+        let resolved = resolve_alias(simple, state);
         let expanded = expand_current(&resolved.args, state);
 
         // Handle leading `NAME=value` assignments within a pipeline stage.
@@ -587,13 +630,11 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
             continue;
         }
 
-        let is_last = idx == n - 1;
-
         // A builtin or function stage runs in a forked subshell that writes to
         // the pipe, so it can sit anywhere in a pipeline (`echo x | wc`, etc.).
         if crate::builtins::is_builtin(&words[0]) || state.functions.contains_key(&words[0]) {
             let (pid, next_in) = match fork_stage(
-                &words,
+                ChildBody::Words(&words),
                 &resolved.redirects,
                 state,
                 prev_in.take(),
@@ -710,12 +751,21 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
     Ok(last_status)
 }
 
-/// Forks a subshell that runs a builtin or function stage of a pipeline with
-/// the correct pipe fds. Returns the child pid and the read end of this
-/// stage's stdout pipe (if not the last stage).
+/// What a forked pipeline stage runs in its subshell: a simple builtin or
+/// function word list, a compound command, or a group/subshell job list.
+#[cfg(unix)]
+enum ChildBody<'a> {
+    Words(&'a [String]),
+    Compound(&'a CompoundCommand),
+    Jobs(&'a [Job]),
+}
+
+/// Forks a subshell that runs a builtin, function or compound stage of a
+/// pipeline with the correct pipe fds. Returns the child pid and the read end
+/// of this stage's stdout pipe (if not the last stage).
 #[cfg(unix)]
 fn fork_stage(
-    words: &[String],
+    body: ChildBody<'_>,
     redirects: &[Redirect],
     state: &mut ShellState,
     stdin_read: Option<OwnedFd>,
@@ -756,7 +806,7 @@ fn fork_stage(
             }
         }
         stage_child_setup(&stdin_read, &out_write, redirects);
-        let code = run_stage_in_child(words, state);
+        let code = run_stage_in_child(body, state);
         unsafe {
             libc::_exit(code);
         }
@@ -837,29 +887,49 @@ fn stage_child_setup(
     }
 }
 
-/// Runs a builtin or shell function inside a forked pipeline stage, returning
-/// its exit code.
+/// Runs a pipeline stage's body inside its forked subshell, returning its
+/// exit code.
 #[cfg(unix)]
-fn run_stage_in_child(words: &[String], state: &mut ShellState) -> i32 {
+fn run_stage_in_child(body: ChildBody<'_>, state: &mut ShellState) -> i32 {
     use std::io::Write;
-    let code = if crate::builtins::is_builtin(&words[0]) {
-        match run_builtin(words, state) {
-            Some(BuiltinResult::Status(c)) | Some(BuiltinResult::Exit(c)) => c,
-            None => 127,
+    let code = match body {
+        ChildBody::Words(words) => {
+            if crate::builtins::is_builtin(&words[0]) {
+                match run_builtin(words, state) {
+                    Some(BuiltinResult::Status(c)) | Some(BuiltinResult::Exit(c)) => c,
+                    None => 127,
+                }
+            } else if let Some(fn_body) = state.functions.get(&words[0]).cloned() {
+                let args = words[1..].to_vec();
+                let saved = std::mem::take(&mut state.positional);
+                state.positional = args;
+                let r = run_jobs_inline(&fn_body, state);
+                state.positional = saved;
+                r.unwrap_or(0)
+            } else {
+                127
+            }
         }
-    } else if let Some(body) = state.functions.get(&words[0]).cloned() {
-        let args = words[1..].to_vec();
-        let saved = std::mem::take(&mut state.positional);
-        state.positional = args;
-        let r = run_jobs_inline(&body, state);
-        state.positional = saved;
-        r.unwrap_or(0)
-    } else {
-        127
+        ChildBody::Compound(c) => run_compound(c, state).unwrap_or(1),
+        ChildBody::Jobs(jobs) => run_jobs_inline(jobs, state).unwrap_or(1),
     };
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     code
+}
+
+/// Short label for a pipeline stage, used in the job table.
+fn stage_label(stage: &PipelineStage) -> String {
+    match stage {
+        PipelineStage::Simple(sc) => sc.args.join(" "),
+        PipelineStage::Compound(CompoundCommand::If(_)) => "if ... fi".to_string(),
+        PipelineStage::Compound(CompoundCommand::For { .. }) => "for ... done".to_string(),
+        PipelineStage::Compound(CompoundCommand::While { .. }) => "while ... done".to_string(),
+        PipelineStage::Compound(CompoundCommand::Case { .. }) => "case ... esac".to_string(),
+        PipelineStage::Compound(CompoundCommand::FunctionDef { name, .. }) => name.clone(),
+        PipelineStage::Group(_) => "{ ...; }".to_string(),
+        PipelineStage::Subshell(_) => "( ... )".to_string(),
+    }
 }
 // --- small libc wrappers for dup/dup2/close, used to redirect builtin stdout
 // and to capture $(...) without depending on an extra crate. ---
@@ -898,10 +968,10 @@ mod tests {
 
     fn pipeline_command(args: &[&str]) -> Pipeline {
         Pipeline {
-            commands: vec![SimpleCommand {
+            commands: vec![PipelineStage::Simple(SimpleCommand {
                 args: args.iter().map(|s| s.to_string()).collect(),
                 redirects: vec![],
-            }],
+            })],
             background: false,
         }
     }

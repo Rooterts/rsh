@@ -14,19 +14,27 @@ pub struct SimpleCommand {
 
 #[derive(Debug, Clone)]
 pub struct Pipeline {
-    pub commands: Vec<SimpleCommand>,
+    pub commands: Vec<PipelineStage>,
     pub background: bool,
 }
 
-/// An executable "unit": either a pipeline of simple commands, or a compound
-/// command (if/for/while/until/case). These cannot be mixed — a compound
-/// command cannot be part of a pipe in this version (a simplification
-/// documented in the README).
+/// One stage of a pipeline: a simple command, a compound command, a group
+/// `{ ...; }` or a subshell `( ... )`. Compound stages run in a forked
+/// subshell connected to the pipe (see the executor).
+#[derive(Debug, Clone)]
+pub enum PipelineStage {
+    Simple(SimpleCommand),
+    Compound(CompoundCommand),
+    Group(Vec<Job>),
+    Subshell(Vec<Job>),
+}
+
+/// An executable "unit": a pipeline (whose stages may be simple or compound),
+/// or a function definition.
 #[derive(Debug, Clone)]
 pub enum Unit {
     Pipeline(Pipeline),
     Compound(CompoundCommand),
-    Group(Vec<Job>), // `{ cmd1; cmd2; }` — runs its jobs in the current shell
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +146,7 @@ fn is_terminator(tokens: &[Token], i: usize, terminators: &[&str]) -> bool {
     match tokens.get(i) {
         Some(Token::CaseEnd) => true,
         Some(Token::RBrace) => true, // `{ ...; }` group or function body closing brace
+        Some(Token::RParen) => true, // `( ... )` subshell closing paren
         Some(Token::Word(w)) => terminators.contains(&w.as_str()),
         _ => false,
     }
@@ -151,41 +160,11 @@ fn expect_word(tokens: &[Token], i: usize, word: &str) -> Result<usize, String> 
 }
 
 fn parse_unit(tokens: &[Token], i: usize) -> Result<(Unit, usize), String> {
-    if let Some(Token::Word(w)) = tokens.get(i) {
-        match w.as_str() {
-            "if" => {
-                let (cmd, next) = parse_if(tokens, i + 1)?;
-                return Ok((Unit::Compound(CompoundCommand::If(cmd)), next));
-            }
-            "for" => {
-                let (cmd, next) = parse_for(tokens, i + 1)?;
-                return Ok((Unit::Compound(cmd), next));
-            }
-            "while" => {
-                let (cmd, next) = parse_while(tokens, i + 1, false)?;
-                return Ok((Unit::Compound(cmd), next));
-            }
-            "until" => {
-                let (cmd, next) = parse_while(tokens, i + 1, true)?;
-                return Ok((Unit::Compound(cmd), next));
-            }
-            "case" => {
-                let (cmd, next) = parse_case(tokens, i + 1)?;
-                return Ok((Unit::Compound(cmd), next));
-            }
-            _ => {
-                // A `name ()` / `name()` sequence starts a function definition.
-                if matches!(tokens.get(i + 1), Some(Token::LParen)) {
-                    return parse_function(tokens, i);
-                }
-            }
-        }
-    }
-
-    // A `{ ...; }` group command.
-    if matches!(tokens.get(i), Some(Token::LBrace)) {
-        let (jobs, next) = parse_group(tokens, i)?;
-        return Ok((Unit::Group(jobs), next));
+    // A `name ()` / `name()` sequence starts a function definition.
+    if let Some(Token::Word(_)) = tokens.get(i)
+        && matches!(tokens.get(i + 1), Some(Token::LParen))
+    {
+        return parse_function(tokens, i);
     }
 
     let (pipeline, next) = parse_pipeline(tokens, i)?;
@@ -386,13 +365,56 @@ fn parse_case(tokens: &[Token], mut i: usize) -> Result<(CompoundCommand, usize)
     Ok((CompoundCommand::Case { word, arms }, i))
 }
 
-/// Parses a pipeline (commands joined by |) up to &&, ||, ; or the end.
+/// Parses one pipeline stage: a compound command (`if`/`for`/`while`/`until`/
+/// `case`), a `{ ...; }` group, a `( ... )` subshell, or a simple command.
+fn parse_pipeline_stage(tokens: &[Token], i: usize) -> Result<(PipelineStage, usize), String> {
+    if let Some(Token::Word(w)) = tokens.get(i) {
+        match w.as_str() {
+            "if" => {
+                let (cmd, next) = parse_if(tokens, i + 1)?;
+                return Ok((PipelineStage::Compound(CompoundCommand::If(cmd)), next));
+            }
+            "for" => {
+                let (cmd, next) = parse_for(tokens, i + 1)?;
+                return Ok((PipelineStage::Compound(cmd), next));
+            }
+            "while" => {
+                let (cmd, next) = parse_while(tokens, i + 1, false)?;
+                return Ok((PipelineStage::Compound(cmd), next));
+            }
+            "until" => {
+                let (cmd, next) = parse_while(tokens, i + 1, true)?;
+                return Ok((PipelineStage::Compound(cmd), next));
+            }
+            "case" => {
+                let (cmd, next) = parse_case(tokens, i + 1)?;
+                return Ok((PipelineStage::Compound(cmd), next));
+            }
+            _ => {}
+        }
+    }
+    if matches!(tokens.get(i), Some(Token::LBrace)) {
+        let (jobs, next) = parse_group(tokens, i)?;
+        return Ok((PipelineStage::Group(jobs), next));
+    }
+    if matches!(tokens.get(i), Some(Token::LParen)) {
+        let (jobs, next) = parse_command_list(tokens, i + 1, &[])?;
+        if !matches!(tokens.get(next), Some(Token::RParen)) {
+            return Err("expected ')' to close the subshell".to_string());
+        }
+        return Ok((PipelineStage::Subshell(jobs), next + 1));
+    }
+    let (cmd, next) = parse_simple_command(tokens, i)?;
+    Ok((PipelineStage::Simple(cmd), next))
+}
+
+/// Parses a pipeline (commands joined by |) up to &&, ||, ;, & or the end.
 fn parse_pipeline(tokens: &[Token], mut i: usize) -> Result<(Pipeline, usize), String> {
     let mut commands = Vec::new();
     let mut background = false;
 
     loop {
-        let (cmd, next_i) = parse_simple_command(tokens, i)?;
+        let (cmd, next_i) = parse_pipeline_stage(tokens, i)?;
         commands.push(cmd);
         i = next_i;
 
@@ -459,4 +481,70 @@ fn parse_simple_command(tokens: &[Token], mut i: usize) -> Result<(SimpleCommand
     }
 
     Ok((SimpleCommand { args, redirects }, i))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokenizer::tokenize;
+
+    fn parse_line(line: &str) -> Vec<Job> {
+        parse(tokenize(line).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_if_piped_becomes_compound_stage() {
+        let jobs = parse_line("if true; then echo hi; fi | cat");
+        assert_eq!(jobs.len(), 1);
+        let Unit::Pipeline(p) = &jobs[0].unit else {
+            panic!("expected pipeline")
+        };
+        assert_eq!(p.commands.len(), 2);
+        assert!(matches!(p.commands[0], PipelineStage::Compound(_)));
+        assert!(matches!(p.commands[1], PipelineStage::Simple(_)));
+        assert!(!p.background);
+    }
+
+    #[test]
+    fn test_if_backgrounded() {
+        let jobs = parse_line("if true; then echo hi; fi &");
+        let Unit::Pipeline(p) = &jobs[0].unit else {
+            panic!("expected pipeline")
+        };
+        assert_eq!(p.commands.len(), 1);
+        assert!(matches!(p.commands[0], PipelineStage::Compound(_)));
+        assert!(p.background);
+    }
+
+    #[test]
+    fn test_group_piped() {
+        let jobs = parse_line("{ echo a; echo b; } | sort");
+        let Unit::Pipeline(p) = &jobs[0].unit else {
+            panic!("expected pipeline")
+        };
+        assert!(matches!(p.commands[0], PipelineStage::Group(_)));
+        assert_eq!(p.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_subshell_stage() {
+        let jobs = parse_line("(cd /tmp; pwd) | cat");
+        let Unit::Pipeline(p) = &jobs[0].unit else {
+            panic!("expected pipeline")
+        };
+        assert!(matches!(p.commands[0], PipelineStage::Subshell(_)));
+        assert_eq!(p.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_standalone_if_is_single_compound_stage() {
+        // A bare compound is a one-stage pipeline; the executor runs such a
+        // stage in-process so variables set inside loops persist.
+        let jobs = parse_line("for w in a b; do echo $w; done");
+        let Unit::Pipeline(p) = &jobs[0].unit else {
+            panic!("expected pipeline")
+        };
+        assert_eq!(p.commands.len(), 1);
+        assert!(matches!(p.commands[0], PipelineStage::Compound(_)));
+    }
 }

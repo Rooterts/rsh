@@ -100,6 +100,10 @@ src/
   builtin or shell function run in a forked subshell connected to the pipe
   (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), so they
   no longer need an external binary of the same name.
+- **Compound commands as pipeline stages**: `if/for/while/until/case`, `{ }`
+  groups and `( )` subshells can be piped or backgrounded (`if ...; fi | cat`,
+  `echo x | while read l; do ...; done`, `mycommand &`). A stage that is
+  compound runs in a forked subshell connected to the pipe, like POSIX shells.
 - **Pipeline-wide job control**: all stages of a pipeline run in a single
   process group that owns the terminal while it runs, so ^C interrupts and
   ^Z stops the *whole* pipeline; it becomes one job you can `fg`/`bg`.
@@ -141,13 +145,13 @@ fg %1           # bring it back to the foreground
 
 ## Known limitations (documented on purpose)
 
-- **Compound commands cannot be piped** (e.g. `if ...; fi | cat`) nor run in
-  the background with `&` — they are separate from simple pipelines.
+- Here-documents (`<<EOF`) are not parsed yet.
+- Redirects attached to a compound stage (`if ...; fi > out`) are ignored.
 
 ## Suggested next steps (a useful roadmap)
 
-1. Compound commands (`if`/`for`/`while`/functions) piped or backgrounded.
-2. Here-documents (`<<`).
+1. Here-documents.
+2. `getopts`, arithmetic `for ((...))` and more POSIX edge cases.
 
 ## License
 

@@ -102,6 +102,10 @@ src/
   builtin o función corre en un subshell forkeado conectado al pipe
   (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), así ya
   no hace falta que exista un binario externo del mismo nombre.
+- **Comandos compuestos como etapas de pipe**: `if/for/while/until/case`,
+  grupos `{ }` y subshells `( )` pueden pipearse o backgroundearse
+  (`if ...; fi | cat`, `echo x | while read l; do ...; done`). Una etapa
+  compuesta corre en un subshell forkeado conectado al pipe, como en POSIX.
 - **Job control de toda la pipeline**: todas las etapas corren en un mismo
   grupo de procesos que posee la terminal mientras corre, así ^C interrumpe y
   ^Z detiene la pipeline *entera*; pasa a ser un único job para `fg`/`bg`.
@@ -144,13 +148,14 @@ fg %1           # lo vuelve a primer plano
 
 ## Limitaciones conocidas (documentadas a propósito)
 
-- **Los comandos compuestos no pueden ir en un pipe** (ej. `if ...; fi | cat`)
-  ni backgroundearse con `&` — son unidades aparte de las pipelines simples.
+- Los here-documents (`<<EOF`) aún no se parsean.
+- Las redirecciones pegadas a una etapa compuesta (`if ...; fi > out`) se
+  ignoran.
 
 ## Próximos pasos sugeridos (roadmap)
 
-1. Comandos compuestos (`if`/`for`/`while`/funciones) en pipe o background.
-2. Here-documents (`<<`).
+1. Here-documents.
+2. `getopts`, `for ((...))` aritmético y más casos límite POSIX.
 
 ## Licencia
 
