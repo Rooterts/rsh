@@ -79,9 +79,15 @@ pub fn background_child_setup() {
 }
 
 /// Shell-wide signal setup: a shell is not itself a job, so it ignores ^Z.
+/// It must also ignore SIGTTOU/SIGTTIN: otherwise calling tcsetpgrp while the
+/// shell is in the background (e.g. taking the terminal back after a
+/// foreground child finished) would stop the shell itself with
+/// "suspended (tty output)".
 pub fn shell_setup() {
     unsafe {
         let _ = libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+        let _ = libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        let _ = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
 }
 
