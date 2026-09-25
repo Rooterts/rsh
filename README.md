@@ -100,6 +100,9 @@ src/
   builtin or shell function run in a forked subshell connected to the pipe
   (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), so they
   no longer need an external binary of the same name.
+- **Pipeline-wide job control**: all stages of a pipeline run in a single
+  process group that owns the terminal while it runs, so ^C interrupts and
+  ^Z stops the *whole* pipeline; it becomes one job you can `fg`/`bg`.
 - **Tab completion** for command names and file paths (`rustyline::Helper`).
 - **Finer signal handling**: every foreground child runs in its own process
   group and receives the terminal, so Ctrl+C interrupts only the command and
@@ -140,15 +143,11 @@ fg %1           # bring it back to the foreground
 
 - **Compound commands cannot be piped** (e.g. `if ...; fi | cat`) nor run in
   the background with `&` — they are separate from simple pipelines.
-- **Pipe lines have no per-stage job control**: a single command (foreground)
-  is the only construct with its own process group and ^C/^Z handling. A
-  foreground pipeline, and its intermediate stages, run in the shell's group.
 
 ## Suggested next steps (a useful roadmap)
 
-1. Multi-stage pipeline job control (each stage in its own process group).
-2. Compound commands (`if`/`for`/`while`/functions) piped or backgrounded.
-3. Here-documents (`<<`).
+1. Compound commands (`if`/`for`/`while`/functions) piped or backgrounded.
+2. Here-documents (`<<`).
 
 ## License
 

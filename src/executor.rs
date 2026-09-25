@@ -561,16 +561,18 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
     let n = pipeline.commands.len();
     let background = pipeline.background;
 
-    // A human-readable label for the job table (only needed for background).
+    // A human-readable label for the job table.
     let label = pipeline
         .commands
         .iter()
-        .flat_map(|c| c.args.iter().cloned())
+        .map(|c| c.args.join(" "))
         .collect::<Vec<_>>()
         .join(" | ");
 
-    // Pids of every forked/spawned stage, waited in order at the end.
+    // Pids of every forked/spawned stage; the whole pipeline shares one
+    // process group, led by the first stage's pid.
     let mut child_pids: Vec<i32> = Vec::with_capacity(n);
+    let mut pgid: Option<i32> = None;
     // Read end of the previous stage's pipe, feeding this stage's stdin.
     let mut prev_in: Option<OwnedFd> = None;
 
@@ -590,16 +592,26 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
         // A builtin or function stage runs in a forked subshell that writes to
         // the pipe, so it can sit anywhere in a pipeline (`echo x | wc`, etc.).
         if crate::builtins::is_builtin(&words[0]) || state.functions.contains_key(&words[0]) {
-            let (pid, next_in) =
-                match fork_stage(&words, &resolved.redirects, state, prev_in.take(), is_last) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("rsh: {}: {}", words[0], e);
-                        return Ok(127);
-                    }
-                };
+            let (pid, next_in) = match fork_stage(
+                &words,
+                &resolved.redirects,
+                state,
+                prev_in.take(),
+                is_last,
+                pgid,
+                background,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("rsh: {}: {}", words[0], e);
+                    return Ok(127);
+                }
+            };
             prev_in = next_in;
             child_pids.push(pid);
+            if pgid.is_none() {
+                pgid = Some(pid);
+            }
             continue;
         }
 
@@ -624,10 +636,23 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
 
         if background {
             command.stdin(Stdio::null());
-            #[cfg(unix)]
+        }
+        #[cfg(unix)]
+        {
+            // Join the pipeline's process group and pick default (foreground)
+            // or ignored (background) signal dispositions.
+            let grp = pgid.unwrap_or(0);
             unsafe {
-                command.pre_exec(|| {
-                    crate::jobctl::background_child_setup();
+                command.pre_exec(move || {
+                    let _ = libc::setpgid(0, grp);
+                    if background {
+                        let _ = libc::signal(libc::SIGINT, libc::SIG_IGN);
+                        let _ = libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+                    } else {
+                        let _ = libc::signal(libc::SIGINT, libc::SIG_DFL);
+                        let _ = libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                        let _ = libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+                    }
                     Ok(())
                 });
             }
@@ -638,7 +663,16 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
                 if !is_last && let Some(out) = child.stdout.take() {
                     prev_in = Some(unsafe { OwnedFd::from_raw_fd(out.into_raw_fd()) });
                 }
-                child_pids.push(child.id() as i32);
+                let pid = child.id() as i32;
+                // Both the child (pre_exec) and the parent do setpgid; one of
+                // them wins the race, and errors are expected/ignored.
+                unsafe {
+                    let _ = libc::setpgid(pid, pgid.unwrap_or(pid));
+                }
+                if pgid.is_none() {
+                    pgid = Some(pid);
+                }
+                child_pids.push(pid);
             }
             Err(e) => {
                 eprintln!("rsh: {}: {}", words[0], e);
@@ -648,17 +682,30 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
     }
 
     if background {
-        if let Some(&pid) = child_pids.last() {
-            crate::jobctl::set_group(pid);
-            let id = state.add_job(label, pid);
-            println!("[{}] {}", id, pid);
+        if let Some(grp) = pgid {
+            let id = state.add_job(label, grp);
+            println!("[{}] {}", id, grp);
         }
         return Ok(0);
     }
 
-    let mut last_status = 0;
-    for pid in child_pids {
-        last_status = crate::jobctl::wait_blocking(pid).unwrap_or(1);
+    // Foreground pipeline: give the terminal to the group, wait for every
+    // stage (noticing ^Z stops), then take the terminal back.
+    if let Some(grp) = pgid {
+        crate::jobctl::give_terminal(grp);
+    }
+    let (last_status, stopped) = crate::jobctl::wait_pipeline(&child_pids);
+    crate::jobctl::release_terminal();
+
+    if stopped {
+        if let Some(grp) = pgid {
+            let id = state.add_job(label.clone(), grp);
+            if let Some(job) = state.jobs.last_mut() {
+                job.stopped = true;
+            }
+            println!("[{}]  Stopped  {}", id, label);
+        }
+        return Ok(128 + libc::SIGTSTP);
     }
     Ok(last_status)
 }
@@ -673,6 +720,8 @@ fn fork_stage(
     state: &mut ShellState,
     stdin_read: Option<OwnedFd>,
     is_last: bool,
+    pgid: Option<i32>,
+    background: bool,
 ) -> std::io::Result<(i32, Option<OwnedFd>)> {
     let (next_read, out_write): (Option<OwnedFd>, Option<OwnedFd>) = if is_last {
         (None, None)
@@ -693,7 +742,19 @@ fn fork_stage(
     }
 
     if pid == 0 {
-        // Child: a subshell running the builtin/function with the pipe fds.
+        // Child: join the pipeline's process group, reset signal dispositions,
+        // and run the builtin/function with the pipe fds.
+        unsafe {
+            let _ = libc::setpgid(0, pgid.unwrap_or(0));
+            if background {
+                let _ = libc::signal(libc::SIGINT, libc::SIG_IGN);
+                let _ = libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+            } else {
+                let _ = libc::signal(libc::SIGINT, libc::SIG_DFL);
+                let _ = libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                let _ = libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            }
+        }
         stage_child_setup(&stdin_read, &out_write, redirects);
         let code = run_stage_in_child(words, state);
         unsafe {
@@ -701,7 +762,10 @@ fn fork_stage(
         }
     }
 
-    // Parent: the child owns (a copy of) these ends; drop ours.
+    // Parent: both sides race to set the group; dropping our pipe ends.
+    unsafe {
+        let _ = libc::setpgid(pid, pgid.unwrap_or(pid));
+    }
     drop(out_write);
     drop(stdin_read);
     Ok((pid, next_read))

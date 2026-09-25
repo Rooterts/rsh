@@ -106,11 +106,38 @@ unsafe fn signal_dispose(sig: libc::c_int, handler: libc::sighandler_t) {
     }
 }
 
-/// Sends SIGCONT to a stopped job to resume it.
-pub fn continue_job(pid: i32) {
+/// Sends SIGCONT to every process of a job's process group (`-pgid`) to resume
+/// it. Single-process jobs have pid == pgid, so this works for both.
+pub fn continue_job(pgid: i32) {
     unsafe {
-        let _ = libc::kill(pid, libc::SIGCONT);
+        let _ = libc::kill(-pgid, libc::SIGCONT);
     }
+}
+
+/// Waits for every stage pid of a foreground pipeline (all in one process
+/// group), honoring stops (^Z). Returns the last stage's exit status and
+/// whether the pipeline stopped instead of running to completion.
+pub fn wait_pipeline(pids: &[i32]) -> (i32, bool) {
+    ignore_sigint_on();
+    let mut last = 0;
+    let mut stopped = false;
+    for &pid in pids {
+        let mut status = 0;
+        let mut ret = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        while ret < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            ret = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        }
+        if ret < 0 {
+            continue; // pid already reaped by someone else
+        }
+        if libc::WIFSTOPPED(status) {
+            stopped = true;
+        } else {
+            last = exit_status(status);
+        }
+    }
+    ignore_sigint_off();
+    (last, stopped)
 }
 
 /// Non-blocking reap: returns `Some(status)` if the child has been reaped,
@@ -183,7 +210,19 @@ mod tests {
     use super::*;
 
     fn spawn_sh(args: &[&str]) -> std::process::Child {
-        std::process::Command::new("sh").args(args).spawn().unwrap()
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(args);
+        // Give the child its own process group before exec, exactly how the
+        // executor does it for real jobs (setpgid from the parent races with
+        // exec and can fail with EACCES).
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        cmd.spawn().unwrap()
     }
 
     #[test]

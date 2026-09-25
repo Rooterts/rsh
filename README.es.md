@@ -102,6 +102,9 @@ src/
   builtin o función corre en un subshell forkeado conectado al pipe
   (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), así ya
   no hace falta que exista un binario externo del mismo nombre.
+- **Job control de toda la pipeline**: todas las etapas corren en un mismo
+  grupo de procesos que posee la terminal mientras corre, así ^C interrumpe y
+  ^Z detiene la pipeline *entera*; pasa a ser un único job para `fg`/`bg`.
 - **Autocompletado con Tab** de nombres de comandos y rutas de archivos
   (`rustyline::Helper`).
 - **Manejo de señales fino**: cada comando en primer plano corre en su propio
@@ -143,15 +146,11 @@ fg %1           # lo vuelve a primer plano
 
 - **Los comandos compuestos no pueden ir en un pipe** (ej. `if ...; fi | cat`)
   ni backgroundearse con `&` — son unidades aparte de las pipelines simples.
-- **Las pipelines no tienen job control por etapa**: solo un comando simple en
-  primer plano tiene grupo de procesos propio y manejo de ^C/^Z. Una pipeline
-  en primer plano, y sus etapas intermedias, corren en el grupo de la shell.
 
 ## Próximos pasos sugeridos (roadmap)
 
-1. Job control por etapa en pipelines (cada etapa en su grupo de procesos).
-2. Comandos compuestos (`if`/`for`/`while`/funciones) en pipe o background.
-3. Here-documents (`<<`).
+1. Comandos compuestos (`if`/`for`/`while`/funciones) en pipe o background.
+2. Here-documents (`<<`).
 
 ## Licencia
 
