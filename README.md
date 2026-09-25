@@ -94,6 +94,10 @@ src/
 - **`read` builtin**: `read [-r] name1 name2 ...` parses a line from stdin
   into variables (the last one receives the rest), so
   `while read x; do ...; done` works.
+- **Builtins and functions everywhere in a pipe**: stages that resolve to a
+  builtin or shell function run in a forked subshell connected to the pipe
+  (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), so they
+  no longer need an external binary of the same name.
 - **Tab completion** for command names and file paths (`rustyline::Helper`).
 - **Finer signal handling**: every foreground child runs in its own process
   group and receives the terminal, so Ctrl+C interrupts only the command and
@@ -134,10 +138,6 @@ fg %1           # bring it back to the foreground
 
 - **Compound commands cannot be piped** (e.g. `if ...; fi | cat`) nor run in
   the background with `&` — they are separate from simple pipelines.
-- **Builtins inside a pipe** (e.g. `export FOO=1 | cat`) are not supported —
-  they only run standalone, at the end of `&&`/`;`, or with a stdout
-  redirection (`>`/`>>`). Putting them mid-pipe would require manual `fork()`
-  instead of `std::process::Command`.
 - **Pipe lines have no per-stage job control**: a single command (foreground)
   is the only construct with its own process group and ^C/^Z handling. A
   foreground pipeline, and its intermediate stages, run in the shell's group.
@@ -149,9 +149,8 @@ fg %1           # bring it back to the foreground
 
 1. Multi-stage pipeline job control (each stage in its own process group).
 2. Asynchronous "Done" notifications for background jobs (a `SIGCHLD` handler).
-3. Builtins running in the middle of a real pipe (manual `fork()`).
-4. Compound commands (`if`/`for`/`while`/functions) piped or backgrounded.
-5. Here-documents (`<<`).
+3. Compound commands (`if`/`for`/`while`/functions) piped or backgrounded.
+4. Here-documents (`<<`).
 
 ## License
 

@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 use crate::builtins::{BuiltinResult, ShellState, run_builtin};
 use crate::expand::expand_args;
@@ -557,6 +560,7 @@ fn apply_redirects(
 fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<i32, RunError> {
     let n = pipeline.commands.len();
     let background = pipeline.background;
+
     // A human-readable label for the job table (only needed for background).
     let label = pipeline
         .commands
@@ -564,8 +568,11 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
         .flat_map(|c| c.args.iter().cloned())
         .collect::<Vec<_>>()
         .join(" | ");
-    let mut children: Vec<Child> = Vec::with_capacity(n);
-    let mut prev_stdout: Option<Stdio> = None;
+
+    // Pids of every forked/spawned stage, waited in order at the end.
+    let mut child_pids: Vec<i32> = Vec::with_capacity(n);
+    // Read end of the previous stage's pipe, feeding this stage's stdin.
+    let mut prev_in: Option<OwnedFd> = None;
 
     for (idx, cmd) in pipeline.commands.iter().enumerate() {
         let resolved = resolve_alias(cmd, state);
@@ -578,14 +585,35 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
             continue;
         }
 
+        let is_last = idx == n - 1;
+
+        // A builtin or function stage runs in a forked subshell that writes to
+        // the pipe, so it can sit anywhere in a pipeline (`echo x | wc`, etc.).
+        if crate::builtins::is_builtin(&words[0]) || state.functions.contains_key(&words[0]) {
+            let (pid, next_in) =
+                match fork_stage(&words, &resolved.redirects, state, prev_in.take(), is_last) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("rsh: {}: {}", words[0], e);
+                        return Ok(127);
+                    }
+                };
+            prev_in = next_in;
+            child_pids.push(pid);
+            continue;
+        }
+
+        // External executable, spawned via exec (fds handled by std::Command).
         let mut command = Command::new(&words[0]);
         command.args(&words[1..]);
         for (key, value) in &assigns {
             command.env(key, value);
         }
 
-        let stdin = prev_stdout.take().unwrap_or_else(Stdio::inherit);
-        let is_last = idx == n - 1;
+        let stdin = match prev_in.take() {
+            Some(fd) => Stdio::from(fd),
+            None => Stdio::inherit(),
+        };
         let stdout = if is_last {
             Stdio::inherit()
         } else {
@@ -607,10 +635,10 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
 
         match command.spawn() {
             Ok(mut child) => {
-                if !is_last {
-                    prev_stdout = child.stdout.take().map(Stdio::from);
+                if !is_last && let Some(out) = child.stdout.take() {
+                    prev_in = Some(unsafe { OwnedFd::from_raw_fd(out.into_raw_fd()) });
                 }
-                children.push(child);
+                child_pids.push(child.id() as i32);
             }
             Err(e) => {
                 eprintln!("rsh: {}: {}", words[0], e);
@@ -620,8 +648,7 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
     }
 
     if background {
-        if let Some(last) = children.last() {
-            let pid = last.id() as i32;
+        if let Some(&pid) = child_pids.last() {
             crate::jobctl::set_group(pid);
             let id = state.add_job(label, pid);
             println!("[{}] {}", id, pid);
@@ -630,12 +657,146 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
     }
 
     let mut last_status = 0;
-    for mut child in children {
-        last_status = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+    for pid in child_pids {
+        last_status = crate::jobctl::wait_blocking(pid).unwrap_or(1);
     }
     Ok(last_status)
 }
 
+/// Forks a subshell that runs a builtin or function stage of a pipeline with
+/// the correct pipe fds. Returns the child pid and the read end of this
+/// stage's stdout pipe (if not the last stage).
+#[cfg(unix)]
+fn fork_stage(
+    words: &[String],
+    redirects: &[Redirect],
+    state: &mut ShellState,
+    stdin_read: Option<OwnedFd>,
+    is_last: bool,
+) -> std::io::Result<(i32, Option<OwnedFd>)> {
+    let (next_read, out_write): (Option<OwnedFd>, Option<OwnedFd>) = if is_last {
+        (None, None)
+    } else {
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        (
+            Some(unsafe { OwnedFd::from_raw_fd(fds[0]) }),
+            Some(unsafe { OwnedFd::from_raw_fd(fds[1]) }),
+        )
+    };
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if pid == 0 {
+        // Child: a subshell running the builtin/function with the pipe fds.
+        stage_child_setup(&stdin_read, &out_write, redirects);
+        let code = run_stage_in_child(words, state);
+        unsafe {
+            libc::_exit(code);
+        }
+    }
+
+    // Parent: the child owns (a copy of) these ends; drop ours.
+    drop(out_write);
+    drop(stdin_read);
+    Ok((pid, next_read))
+}
+
+/// Child-side fd setup for a forked pipeline stage: applies redirects, then
+/// wires the incoming pipe read end and outgoing write end, closing the latter
+/// so a downstream reader sees EOF when the stage exits.
+#[cfg(unix)]
+fn stage_child_setup(
+    stdin_read: &Option<OwnedFd>,
+    stdout_write: &Option<OwnedFd>,
+    redirects: &[Redirect],
+) {
+    let mut in_set = false;
+    let mut out_set = false;
+    for r in redirects {
+        match r.kind {
+            RedirectKind::In => {
+                if let Ok(f) = std::fs::File::open(&r.target) {
+                    let fd = f.as_raw_fd();
+                    unsafe {
+                        libc::dup2(fd, libc::STDIN_FILENO);
+                    }
+                    in_set = true;
+                }
+            }
+            RedirectKind::Out | RedirectKind::Append => {
+                let f = if r.kind == RedirectKind::Out {
+                    std::fs::File::create(&r.target)
+                } else {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&r.target)
+                };
+                if let Ok(f) = f {
+                    let fd = f.as_raw_fd();
+                    unsafe {
+                        libc::dup2(fd, libc::STDOUT_FILENO);
+                    }
+                    out_set = true;
+                }
+            }
+            RedirectKind::ErrOut => {
+                if let Ok(f) = std::fs::File::create(&r.target) {
+                    let fd = f.as_raw_fd();
+                    unsafe {
+                        libc::dup2(fd, libc::STDERR_FILENO);
+                    }
+                }
+            }
+        }
+    }
+    unsafe {
+        if !in_set && let Some(fd) = stdin_read {
+            libc::dup2(fd.as_raw_fd(), libc::STDIN_FILENO);
+        }
+        if !out_set && let Some(fd) = stdout_write {
+            libc::dup2(fd.as_raw_fd(), libc::STDOUT_FILENO);
+        }
+        // Close inherited pipe ends so other stages observe EOF promptly.
+        if let Some(fd) = stdin_read {
+            libc::close(fd.as_raw_fd());
+        }
+        if let Some(fd) = stdout_write {
+            libc::close(fd.as_raw_fd());
+        }
+    }
+}
+
+/// Runs a builtin or shell function inside a forked pipeline stage, returning
+/// its exit code.
+#[cfg(unix)]
+fn run_stage_in_child(words: &[String], state: &mut ShellState) -> i32 {
+    use std::io::Write;
+    let code = if crate::builtins::is_builtin(&words[0]) {
+        match run_builtin(words, state) {
+            Some(BuiltinResult::Status(c)) | Some(BuiltinResult::Exit(c)) => c,
+            None => 127,
+        }
+    } else if let Some(body) = state.functions.get(&words[0]).cloned() {
+        let args = words[1..].to_vec();
+        let saved = std::mem::take(&mut state.positional);
+        state.positional = args;
+        let r = run_jobs_inline(&body, state);
+        state.positional = saved;
+        r.unwrap_or(0)
+    } else {
+        127
+    };
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    code
+}
 // --- small libc wrappers for dup/dup2/close, used to redirect builtin stdout
 // and to capture $(...) without depending on an extra crate. ---
 #[cfg(unix)]
