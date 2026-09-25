@@ -100,6 +100,9 @@ src/
   builtin or shell function run in a forked subshell connected to the pipe
   (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), so they
   no longer need an external binary of the same name.
+- **Here-documents**: `cat <<EOF` / `<<-` (tab-stripping) / `<<'EOF'`
+  (no expansion); bodies gather with a `> ` continuation prompt and feed any
+  command, pipeline stage or compound (`while read l; ...; done <<E`).
 - **Compound commands as pipeline stages**: `if/for/while/until/case`, `{ }`
   groups and `( )` subshells can be piped or backgrounded (`if ...; fi | cat`,
   `echo x | while read l; do ...; done`, `mycommand &`). A stage that is
@@ -145,13 +148,12 @@ fg %1           # bring it back to the foreground
 
 ## Known limitations (documented on purpose)
 
-- Here-documents (`<<EOF`) are not parsed yet.
-- Redirects attached to a compound stage (`if ...; fi > out`) are ignored.
+- Heredoc bodies expand `$VAR`-style variables but not `$(command)` inside
+  them, and `$(...)` cannot span multiple physical lines.
 
 ## Suggested next steps (a useful roadmap)
 
-1. Here-documents.
-2. `getopts`, arithmetic `for ((...))` and more POSIX edge cases.
+1. `getopts`, arithmetic `for ((...))` and more POSIX edge cases.
 
 ## License
 

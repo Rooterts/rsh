@@ -202,10 +202,16 @@ fn run_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<i32, RunE
         // A single compound stage runs in-process (no pipe to satisfy), so
         // loops/ifs can mutate shell state (variables, positional params...).
         match &pipeline.commands[0] {
-            PipelineStage::Compound(c) => return run_compound(c, state),
-            PipelineStage::Group(jobs) => return run_jobs_inline(jobs, state),
-            PipelineStage::Subshell(_) => {} // always forked (subshelled)
-            PipelineStage::Simple(_) => {}
+            // Lone compound/group with no redirects runs in-process, so loops
+            // and ifs can mutate shell state. With redirects (piping or a
+            // heredoc feed) it goes through the forked pipeline path.
+            PipelineStage::Compound(c, reds) if reds.is_empty() => {
+                return run_compound(c, state);
+            }
+            PipelineStage::Group(jobs, reds) if reds.is_empty() => {
+                return run_jobs_inline(jobs, state);
+            }
+            _ => {} // subshell or redirected: run through the pipeline runner
         }
     }
 
@@ -447,6 +453,8 @@ fn open_for_redirect(r: &Redirect) -> Option<File> {
         RedirectKind::Append => OpenOptions::new().create(true).append(true).open(&r.target),
         RedirectKind::In => File::open(&r.target),
         RedirectKind::ErrOut => File::create(&r.target),
+        // Heredocs feed stdin, not a file.
+        RedirectKind::HereDoc | RedirectKind::HereDocStrip => return None,
     };
     result
         .map_err(|e| eprintln!("rsh: {}: {}", r.target, e))
@@ -524,6 +532,39 @@ fn run_external_single(
     }
 }
 
+/// Builds a pipe pre-loaded with the heredoc body and returns its read end.
+/// The body is written from a helper thread so writers never block on a full
+/// pipe buffer.
+#[cfg(unix)]
+fn heredoc_pipe_reader(body: &str) -> Option<OwnedFd> {
+    // O_CLOEXEC: the write end must not leak into spawned children, or they
+    // would hold the pipe open and the reader would never see EOF.
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return None;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let bytes = body.as_bytes().to_vec();
+    std::thread::spawn(move || {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let n = unsafe {
+                libc::write(
+                    write_fd,
+                    bytes[off..].as_ptr() as *const libc::c_void,
+                    bytes.len() - off,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            off += n as usize;
+        }
+        unsafe { libc::close(write_fd) };
+    });
+    Some(unsafe { OwnedFd::from_raw_fd(read_fd) })
+}
+
 fn apply_redirects(
     cmd: &mut Command,
     redirects: &[Redirect],
@@ -558,6 +599,15 @@ fn apply_redirects(
             RedirectKind::ErrOut => {
                 if let Ok(f) = File::create(&r.target) {
                     cmd.stderr(Stdio::from(f));
+                }
+            }
+            RedirectKind::HereDoc | RedirectKind::HereDocStrip => {
+                // A heredoc feeds the command's stdin (overrides the default).
+                let body = r.heredoc_body.clone().unwrap_or_default();
+                #[cfg(unix)]
+                if let Some(fd) = heredoc_pipe_reader(&body) {
+                    cmd.stdin(Stdio::from(fd));
+                    stdin_set = true;
                 }
             }
         }
@@ -596,13 +646,15 @@ fn run_external_pipeline(pipeline: &Pipeline, state: &mut ShellState) -> Result<
         // Compound stages (if/for/while/case, `{ ...; }`, `( ... )`) run in a
         // forked subshell; any state changes inside stay local to it.
         if !matches!(cmd, PipelineStage::Simple(_)) {
-            let body = match cmd {
-                PipelineStage::Compound(c) => ChildBody::Compound(c),
-                PipelineStage::Group(jobs) | PipelineStage::Subshell(jobs) => ChildBody::Jobs(jobs),
+            let (body, reds) = match cmd {
+                PipelineStage::Compound(c, reds) => (ChildBody::Compound(c), reds.as_slice()),
+                PipelineStage::Group(jobs, reds) | PipelineStage::Subshell(jobs, reds) => {
+                    (ChildBody::Jobs(jobs), reds.as_slice())
+                }
                 PipelineStage::Simple(_) => unreachable!(),
             };
             let (pid, next_in) =
-                match fork_stage(body, &[], state, prev_in.take(), is_last, pgid, background) {
+                match fork_stage(body, reds, state, prev_in.take(), is_last, pgid, background) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("rsh: pipeline stage: {}", e);
@@ -868,6 +920,27 @@ fn stage_child_setup(
                     }
                 }
             }
+            RedirectKind::HereDoc | RedirectKind::HereDocStrip => {
+                // In a forked child, write the body synchronously into a fresh
+                // pipe (no threads after fork) and wire its read end to stdin.
+                let body = r.heredoc_body.as_deref().unwrap_or("");
+                let mut fds = [0i32; 2];
+                if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+                    unsafe {
+                        if !body.is_empty() {
+                            let _ = libc::write(
+                                fds[1],
+                                body.as_ptr() as *const libc::c_void,
+                                body.len(),
+                            );
+                        }
+                        libc::close(fds[1]);
+                        libc::dup2(fds[0], libc::STDIN_FILENO);
+                        libc::close(fds[0]);
+                    }
+                    in_set = true;
+                }
+            }
         }
     }
     unsafe {
@@ -922,13 +995,13 @@ fn run_stage_in_child(body: ChildBody<'_>, state: &mut ShellState) -> i32 {
 fn stage_label(stage: &PipelineStage) -> String {
     match stage {
         PipelineStage::Simple(sc) => sc.args.join(" "),
-        PipelineStage::Compound(CompoundCommand::If(_)) => "if ... fi".to_string(),
-        PipelineStage::Compound(CompoundCommand::For { .. }) => "for ... done".to_string(),
-        PipelineStage::Compound(CompoundCommand::While { .. }) => "while ... done".to_string(),
-        PipelineStage::Compound(CompoundCommand::Case { .. }) => "case ... esac".to_string(),
-        PipelineStage::Compound(CompoundCommand::FunctionDef { name, .. }) => name.clone(),
-        PipelineStage::Group(_) => "{ ...; }".to_string(),
-        PipelineStage::Subshell(_) => "( ... )".to_string(),
+        PipelineStage::Compound(CompoundCommand::If(_), _) => "if ... fi".to_string(),
+        PipelineStage::Compound(CompoundCommand::For { .. }, _) => "for ... done".to_string(),
+        PipelineStage::Compound(CompoundCommand::While { .. }, _) => "while ... done".to_string(),
+        PipelineStage::Compound(CompoundCommand::Case { .. }, _) => "case ... esac".to_string(),
+        PipelineStage::Compound(CompoundCommand::FunctionDef { name, .. }, _) => name.clone(),
+        PipelineStage::Group(..) => "{ ...; }".to_string(),
+        PipelineStage::Subshell(..) => "( ... )".to_string(),
     }
 }
 // --- small libc wrappers for dup/dup2/close, used to redirect builtin stdout

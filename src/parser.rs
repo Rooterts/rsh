@@ -3,7 +3,11 @@ use crate::tokenizer::{RedirectKind, Token};
 #[derive(Debug, Clone)]
 pub struct Redirect {
     pub kind: RedirectKind,
+    /// Redirect target: a file path for </>, or the delimiter for <</<<-.
     pub target: String,
+    /// For heredocs: the gathered body (filled by the shell before running),
+    /// already expanded unless the delimiter was quoted.
+    pub heredoc_body: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,9 +28,9 @@ pub struct Pipeline {
 #[derive(Debug, Clone)]
 pub enum PipelineStage {
     Simple(SimpleCommand),
-    Compound(CompoundCommand),
-    Group(Vec<Job>),
-    Subshell(Vec<Job>),
+    Compound(CompoundCommand, Vec<Redirect>),
+    Group(Vec<Job>, Vec<Redirect>),
+    Subshell(Vec<Job>, Vec<Redirect>),
 }
 
 /// An executable "unit": a pipeline (whose stages may be simple or compound),
@@ -372,40 +376,65 @@ fn parse_pipeline_stage(tokens: &[Token], i: usize) -> Result<(PipelineStage, us
         match w.as_str() {
             "if" => {
                 let (cmd, next) = parse_if(tokens, i + 1)?;
-                return Ok((PipelineStage::Compound(CompoundCommand::If(cmd)), next));
+                let (reds, next) = parse_trailing_redirects(tokens, next);
+                return Ok((
+                    PipelineStage::Compound(CompoundCommand::If(cmd), reds),
+                    next,
+                ));
             }
             "for" => {
                 let (cmd, next) = parse_for(tokens, i + 1)?;
-                return Ok((PipelineStage::Compound(cmd), next));
+                let (reds, next) = parse_trailing_redirects(tokens, next);
+                return Ok((PipelineStage::Compound(cmd, reds), next));
             }
             "while" => {
                 let (cmd, next) = parse_while(tokens, i + 1, false)?;
-                return Ok((PipelineStage::Compound(cmd), next));
+                let (reds, next) = parse_trailing_redirects(tokens, next);
+                return Ok((PipelineStage::Compound(cmd, reds), next));
             }
             "until" => {
                 let (cmd, next) = parse_while(tokens, i + 1, true)?;
-                return Ok((PipelineStage::Compound(cmd), next));
+                let (reds, next) = parse_trailing_redirects(tokens, next);
+                return Ok((PipelineStage::Compound(cmd, reds), next));
             }
             "case" => {
                 let (cmd, next) = parse_case(tokens, i + 1)?;
-                return Ok((PipelineStage::Compound(cmd), next));
+                let (reds, next) = parse_trailing_redirects(tokens, next);
+                return Ok((PipelineStage::Compound(cmd, reds), next));
             }
             _ => {}
         }
     }
     if matches!(tokens.get(i), Some(Token::LBrace)) {
         let (jobs, next) = parse_group(tokens, i)?;
-        return Ok((PipelineStage::Group(jobs), next));
+        let (reds, next) = parse_trailing_redirects(tokens, next);
+        return Ok((PipelineStage::Group(jobs, reds), next));
     }
     if matches!(tokens.get(i), Some(Token::LParen)) {
         let (jobs, next) = parse_command_list(tokens, i + 1, &[])?;
         if !matches!(tokens.get(next), Some(Token::RParen)) {
             return Err("expected ')' to close the subshell".to_string());
         }
-        return Ok((PipelineStage::Subshell(jobs), next + 1));
+        let (reds, next) = parse_trailing_redirects(tokens, next + 1);
+        return Ok((PipelineStage::Subshell(jobs, reds), next));
     }
     let (cmd, next) = parse_simple_command(tokens, i)?;
     Ok((PipelineStage::Simple(cmd), next))
+}
+
+/// Consumes redirect tokens (`> file`, `<<EOF`, ...) that follow a compound
+/// command, as in `if ...; fi > out`.
+fn parse_trailing_redirects(tokens: &[Token], mut i: usize) -> (Vec<Redirect>, usize) {
+    let mut redirects = Vec::new();
+    while let Some(Token::Redirect(kind, target)) = tokens.get(i) {
+        redirects.push(Redirect {
+            kind: *kind,
+            target: target.clone(),
+            heredoc_body: None,
+        });
+        i += 1;
+    }
+    (redirects, i)
 }
 
 /// Parses a pipeline (commands joined by |) up to &&, ||, ;, & or the end.
@@ -460,6 +489,7 @@ fn parse_simple_command(tokens: &[Token], mut i: usize) -> Result<(SimpleCommand
                 redirects.push(Redirect {
                     kind: *kind,
                     target: target.clone(),
+                    heredoc_body: None,
                 });
                 i += 1;
             }
@@ -500,7 +530,7 @@ mod tests {
             panic!("expected pipeline")
         };
         assert_eq!(p.commands.len(), 2);
-        assert!(matches!(p.commands[0], PipelineStage::Compound(_)));
+        assert!(matches!(p.commands[0], PipelineStage::Compound(..)));
         assert!(matches!(p.commands[1], PipelineStage::Simple(_)));
         assert!(!p.background);
     }
@@ -512,7 +542,7 @@ mod tests {
             panic!("expected pipeline")
         };
         assert_eq!(p.commands.len(), 1);
-        assert!(matches!(p.commands[0], PipelineStage::Compound(_)));
+        assert!(matches!(p.commands[0], PipelineStage::Compound(..)));
         assert!(p.background);
     }
 
@@ -522,7 +552,7 @@ mod tests {
         let Unit::Pipeline(p) = &jobs[0].unit else {
             panic!("expected pipeline")
         };
-        assert!(matches!(p.commands[0], PipelineStage::Group(_)));
+        assert!(matches!(p.commands[0], PipelineStage::Group(..)));
         assert_eq!(p.commands.len(), 2);
     }
 
@@ -532,7 +562,7 @@ mod tests {
         let Unit::Pipeline(p) = &jobs[0].unit else {
             panic!("expected pipeline")
         };
-        assert!(matches!(p.commands[0], PipelineStage::Subshell(_)));
+        assert!(matches!(p.commands[0], PipelineStage::Subshell(..)));
         assert_eq!(p.commands.len(), 2);
     }
 
@@ -545,6 +575,6 @@ mod tests {
             panic!("expected pipeline")
         };
         assert_eq!(p.commands.len(), 1);
-        assert!(matches!(p.commands[0], PipelineStage::Compound(_)));
+        assert!(matches!(p.commands[0], PipelineStage::Compound(..)));
     }
 }

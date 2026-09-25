@@ -578,17 +578,43 @@ fn builtin_read(args: &[String], state: &mut ShellState) -> i32 {
         vars.push("REPLY".to_string());
     }
 
-    use std::io::BufRead;
+    // Read one line from fd 0 byte-by-byte (no read-ahead), so buffered
+    // input lines remain available to the shell and to other `read` calls.
     let mut buf = String::new();
-    let n = match std::io::stdin().lock().read_line(&mut buf) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("read: {}", e);
+    let mut got_any = false;
+    #[cfg(unix)]
+    loop {
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n < 0 {
+            eprintln!("read: {}", std::io::Error::last_os_error());
             return 1;
         }
-    };
-    if n == 0 {
-        return 1; // EOF
+        if n == 0 {
+            if !got_any {
+                return 1; // EOF with empty line
+            }
+            break;
+        }
+        got_any = true;
+        if b[0] == b'\n' {
+            break;
+        }
+        buf.push(b[0] as char);
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::BufRead;
+        let n = match std::io::stdin().lock().read_line(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("read: {}", e);
+                return 1;
+            }
+        };
+        if n == 0 {
+            return 1; // EOF
+        }
     }
     if !raw {
         // A backslash escapes the following character (POSIX).

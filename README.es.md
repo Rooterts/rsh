@@ -102,6 +102,9 @@ src/
   builtin o función corre en un subshell forkeado conectado al pipe
   (`echo hi | wc -c`, `printf 'a\nb\n' | grep a`, `export X=1 | cat`), así ya
   no hace falta que exista un binario externo del mismo nombre.
+- **Here-documents**: `cat <<EOF` / `<<-` (quita tabuladores) / `<<'EOF'`
+  (sin expansión); el cuerpo se pide con prompt `> ` y alimenta cualquier
+  comando, etapa de pipe o compuesto (`while read l; ...; done <<E`).
 - **Comandos compuestos como etapas de pipe**: `if/for/while/until/case`,
   grupos `{ }` y subshells `( )` pueden pipearse o backgroundearse
   (`if ...; fi | cat`, `echo x | while read l; do ...; done`). Una etapa
@@ -148,14 +151,12 @@ fg %1           # lo vuelve a primer plano
 
 ## Limitaciones conocidas (documentadas a propósito)
 
-- Los here-documents (`<<EOF`) aún no se parsean.
-- Las redirecciones pegadas a una etapa compuesta (`if ...; fi > out`) se
-  ignoran.
+- Los here-documents expanden `$VAR` pero no `$(comando)` dentro del cuerpo, y
+  `$(...)` no puede abarcar varias líneas físicas.
 
 ## Próximos pasos sugeridos (roadmap)
 
-1. Here-documents.
-2. `getopts`, `for ((...))` aritmético y más casos límite POSIX.
+1. `getopts`, `for ((...))` aritmético y más casos límite POSIX.
 
 ## Licencia
 

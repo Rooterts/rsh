@@ -16,10 +16,12 @@ pub enum Token {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum RedirectKind {
-    Out,    // >
-    Append, // >>
-    In,     // <
-    ErrOut, // 2>
+    Out,          // >
+    Append,       // >>
+    In,           // <
+    ErrOut,       // 2>
+    HereDoc,      // <<  (target = delimiter; body gathered before execution)
+    HereDocStrip, // <<- (same, but leading tabs are stripped from each line)
 }
 
 /// Non-printable control character used as an internal marker: MARK+c means
@@ -61,6 +63,23 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             i += 2;
             continue;
         }
+        if c == '<' && chars.get(i + 1) == Some(&'<') {
+            i += 2;
+            let kind = if chars.get(i) == Some(&'-') {
+                i += 1;
+                RedirectKind::HereDocStrip
+            } else {
+                RedirectKind::HereDoc
+            };
+            // Keep the raw delimiter text (quotes included) so the consumer
+            // can tell <<EOF (expand body) from <<'EOF' (do not expand).
+            let raw_start = i;
+            let _ignored = read_word(&chars, &mut i)?;
+            let target: String = chars[raw_start..i].iter().collect();
+            tokens.push(Token::Redirect(kind, target));
+            continue;
+        }
+
         if c == '>' && chars.get(i + 1) == Some(&'>') {
             i += 2;
             let target = read_word(&chars, &mut i)?;

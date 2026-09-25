@@ -168,6 +168,12 @@ fn main() {
     let history_path = history_file_path();
     let _ = rl.load_history(&history_path);
 
+    // In non-interactive mode (piped script) we must read stdin one line at
+    // a time with no read-ahead: builtins like `read`, heredoc bodies and
+    // forked children all share fd 0, and a buffered reader (or rustyline)
+    // would swallow lines meant for them.
+    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+
     loop {
         // Reap (and, when interactive, announce) finished background jobs
         // before every prompt, like bash's job notifications.
@@ -175,7 +181,20 @@ fn main() {
 
         let prompt = build_prompt(&state);
 
-        match rl.readline(&prompt) {
+        let line_result: Result<String, ReadlineError> = if interactive {
+            rl.readline(&prompt)
+        } else {
+            // Match rustyline's piped behavior: echo the prompt, then read.
+            use std::io::Write;
+            print!("{}", prompt);
+            let _ = std::io::stdout().flush();
+            match read_line_stdin() {
+                Ok(l) => Ok(l),
+                Err(_) => Err(ReadlineError::Eof),
+            }
+        };
+
+        match line_result {
             Ok(line) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -186,8 +205,13 @@ fn main() {
 
                 match tokenizer::tokenize(trimmed) {
                     Ok(tokens) => match parser::parse(tokens) {
-                        Ok(jobs) => {
-                            if let Some(code) = executor::run_jobs(&jobs, &mut state) {
+                        Ok(mut jobs) => {
+                            // Gather heredoc bodies (lines up to each
+                            // delimiter) before running anything.
+                            let fill_ok = fill_heredocs(&mut jobs, &state, interactive, &mut rl);
+                            if fill_ok.is_ok()
+                                && let Some(code) = executor::run_jobs(&jobs, &mut state)
+                            {
                                 let _ = rl.save_history(&history_path);
                                 std::process::exit(code);
                             }
@@ -209,6 +233,120 @@ fn main() {
     }
 
     let _ = rl.save_history(&history_path);
+}
+
+/// Feeds every heredoc redirect in the parsed jobs with its body: successive
+/// input lines (read with the `> ` continuation prompt) up to the delimiter.
+/// With `<<-` leading tabs are stripped; with a quoted delimiter (`<<'EOF'`)
+/// no variable expansion is applied. Returns Err if input was interrupted.
+fn fill_heredocs(
+    jobs: &mut [parser::Job],
+    state: &ShellState,
+    interactive: bool,
+    rl: &mut Editor<RshCompleter, DefaultHistory>,
+) -> Result<(), ()> {
+    for job in jobs {
+        let parser::Unit::Pipeline(p) = &mut job.unit else {
+            continue;
+        };
+        for stage in &mut p.commands {
+            let redirects: &mut Vec<parser::Redirect> = match stage {
+                parser::PipelineStage::Simple(sc) => &mut sc.redirects,
+                parser::PipelineStage::Compound(_, r)
+                | parser::PipelineStage::Group(_, r)
+                | parser::PipelineStage::Subshell(_, r) => r,
+            };
+            for red in redirects.iter_mut() {
+                if !matches!(
+                    red.kind,
+                    tokenizer::RedirectKind::HereDoc | tokenizer::RedirectKind::HereDocStrip
+                ) || red.heredoc_body.is_some()
+                {
+                    continue;
+                }
+                // <<'EOF' (quoted) disables body expansion; <<EOF expands vars.
+                let quoted = red.target.contains('\'') || red.target.contains('"');
+                let delim = expand::strip_marks(&red.target)
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string();
+                let strip_tabs = red.kind == tokenizer::RedirectKind::HereDocStrip;
+
+                let mut body = String::new();
+                loop {
+                    let line_res: Result<String, ReadlineError> = if interactive {
+                        rl.readline("> ")
+                    } else {
+                        use std::io::Write;
+                        print!("> ");
+                        let _ = std::io::stdout().flush();
+                        match read_line_stdin() {
+                            Ok(l) => Ok(l),
+                            Err(_) => Err(ReadlineError::Eof),
+                        }
+                    };
+                    match line_res {
+                        Ok(line) => {
+                            let line = if strip_tabs {
+                                line.trim_start_matches('\t').to_string()
+                            } else {
+                                line
+                            };
+                            if line == delim {
+                                break;
+                            }
+                            body.push_str(&line);
+                            body.push('\n');
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "rsh: warning: here-document delimited by end-of-file (wanted `{}`)",
+                                delim
+                            );
+                            return Err(());
+                        }
+                    }
+                }
+                if !quoted {
+                    body = expand::expand_heredoc(
+                        &body,
+                        &state.vars,
+                        &state.positional,
+                        state.last_status,
+                    );
+                }
+                red.heredoc_body = Some(body);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads one line from stdin (fd 0) one byte at a time, so no read-ahead
+/// steals lines meant for `read`, heredoc bodies or forked children. Used in
+/// non-interactive mode in place of rustyline.
+#[cfg(unix)]
+fn read_line_stdin() -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            // EOF: return whatever we got, or an error if the line is empty.
+            if buf.is_empty() {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            break;
+        }
+        if b[0] == b'\n' {
+            break;
+        }
+        buf.push(b[0]);
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
 fn build_prompt(state: &ShellState) -> String {

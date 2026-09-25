@@ -473,7 +473,8 @@ fn to_glob_pattern(s: &str) -> String {
 }
 
 /// Strips the literalness marks that survived (final quote removal).
-fn strip_marks(s: &str) -> String {
+/// Removes the internal MARK escapes, yielding the user-visible string.
+pub fn strip_marks(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -647,6 +648,23 @@ fn eval_arithmetic<'a>(
     let mut a = Arith::new(input, shell_vars, positional);
     a.skip_ws();
     a.expr()
+}
+
+/// Expands `$VAR`-style references in a heredoc body (parameter/variable
+/// expansion only; command substitution inside heredocs is not expanded, a
+/// documented simplification). Preserves trailing newlines via split_inclusive.
+pub fn expand_heredoc(
+    body: &str,
+    vars: &HashMap<String, String>,
+    positional: &[String],
+    last_status: i32,
+) -> String {
+    let mut vars = vars.clone();
+    let mut out = String::new();
+    for line in body.split_inclusive('\n') {
+        out.push_str(&expand_vars(line, &mut vars, positional, last_status));
+    }
+    out
 }
 
 #[cfg(test)]
