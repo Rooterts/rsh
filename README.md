@@ -91,6 +91,8 @@ src/
   `disown` removes them from the table and `kill [-s sig]` sends signals.
   Job specifiers `%+`/`%%` (most recent), `%-` (second most recent), `%N`
   and a bare PID are accepted by `fg`/`bg`/`wait`/`disown`/`kill`.
+  Finished background jobs are reaped automatically before every prompt and,
+  in interactive sessions, announced with a `[N]  Done  cmd` line.
 - **`read` builtin**: `read [-r] name1 name2 ...` parses a line from stdin
   into variables (the last one receives the rest), so
   `while read x; do ...; done` works.

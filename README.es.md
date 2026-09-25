@@ -92,7 +92,9 @@ src/
   detenido en background. `wait` bloquea hasta que terminan, `disown` los quita
   de la tabla y `kill [-s sig]` envía señales. Los especificadores de job
   `%+`/`%%` (más reciente), `%-` (segundo más reciente), `%N` y un PID a secas
-  funcionan en `fg`/`bg`/`wait`/`disown`/`kill`.
+  funcionan en `fg`/`bg`/`wait`/`disown`/`kill`. Los jobs terminados se
+  recolectan automáticamente antes de cada prompt y, en sesiones interactivas,
+  se anuncian con `[N]  Done  cmd`.
 - **Builtin `read`**: `read [-r] nombre1 nombre2 ...` lee una línea del stdin y
   la reparte en variables (la última se queda con el resto), así que funciona
   `while read x; do ...; done`.
