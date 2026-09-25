@@ -144,17 +144,12 @@ fg %1           # lo vuelve a primer plano
 - **Las pipelines no tienen job control por etapa**: solo un comando simple en
   primer plano tiene grupo de procesos propio y manejo de ^C/^Z. Una pipeline
   en primer plano, y sus etapas intermedias, corren en el grupo de la shell.
-- Los jobs en background se reciclan recién cuando corres `jobs`, `wait` o los
-  traes a primer plano, por lo que un job terminado queda como zombie hasta
-  entonces en vez de anunciarse en el prompt.
 
 ## Próximos pasos sugeridos (roadmap)
 
 1. Job control por etapa en pipelines (cada etapa en su grupo de procesos).
-2. Notificaciones asíncronas "Done" para jobs en background (un handler de
-   `SIGCHLD`).
-3. Comandos compuestos (`if`/`for`/`while`/funciones) en pipe o background.
-4. Here-documents (`<<`).
+2. Comandos compuestos (`if`/`for`/`while`/funciones) en pipe o background.
+3. Here-documents (`<<`).
 
 ## Licencia
 

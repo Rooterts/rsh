@@ -324,6 +324,35 @@ fn resolve_pid(state: &ShellState, arg: &str) -> Option<i32> {
     }
 }
 
+/// Reaps finished background jobs, dropping them from the job table. When the
+/// shell is interactive (stdin is a terminal) it also prints a bash-style
+/// `[%]  Done  cmd` / `[%]  Exit N  cmd` line for each, so a finished job
+/// announces itself at the next prompt instead of remaining a zombie until
+/// the user runs `jobs`/`fg`. Non-interactive shells reap silently.
+pub fn reap_finished_jobs(state: &mut ShellState) {
+    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    let mut i = 0;
+    while i < state.jobs.len() {
+        if state.jobs[i].stopped {
+            i += 1;
+            continue;
+        }
+        match crate::jobctl::try_reap(state.jobs[i].pid) {
+            Some(status) => {
+                let job = state.jobs.remove(i);
+                if interactive {
+                    if status == 0 {
+                        eprintln!("[{}]  Done  {}", job.id, job.command);
+                    } else {
+                        eprintln!("[{}]  Exit {}  {}", job.id, status, job.command);
+                    }
+                }
+            }
+            None => i += 1,
+        }
+    }
+}
+
 /// Implements `jobs`: lists the current job table, reaping and dropping any
 /// background process that has already finished. Accepts `-l` / `-p` flags
 /// which change the prefix (matching common shells).

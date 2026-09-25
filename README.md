@@ -141,16 +141,12 @@ fg %1           # bring it back to the foreground
 - **Pipe lines have no per-stage job control**: a single command (foreground)
   is the only construct with its own process group and ^C/^Z handling. A
   foreground pipeline, and its intermediate stages, run in the shell's group.
-- Background jobs are reaped lazily (when you run `jobs`, `wait` or bring them
-  to the foreground), so a finished background job stays as a zombie until then
-  instead of announcing itself on the prompt.
 
 ## Suggested next steps (a useful roadmap)
 
 1. Multi-stage pipeline job control (each stage in its own process group).
-2. Asynchronous "Done" notifications for background jobs (a `SIGCHLD` handler).
-3. Compound commands (`if`/`for`/`while`/functions) piped or backgrounded.
-4. Here-documents (`<<`).
+2. Compound commands (`if`/`for`/`while`/functions) piped or backgrounded.
+3. Here-documents (`<<`).
 
 ## License
 

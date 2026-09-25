@@ -169,6 +169,10 @@ fn main() {
     let _ = rl.load_history(&history_path);
 
     loop {
+        // Reap (and, when interactive, announce) finished background jobs
+        // before every prompt, like bash's job notifications.
+        crate::builtins::reap_finished_jobs(&mut state);
+
         let prompt = build_prompt(&state);
 
         match rl.readline(&prompt) {
