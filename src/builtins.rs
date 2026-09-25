@@ -647,6 +647,17 @@ fn builtin_cd(args: &[String], state: &mut ShellState) -> i32 {
 
     match env::set_current_dir(Path::new(&target)) {
         Ok(_) => {
+            // Keep OLDPWD/PWD in sync (as bash does), both in the shell's
+            // variable table and the process environment so children see them.
+            if let Some(old) = &cwd_before {
+                state.vars.insert("OLDPWD".into(), old.clone());
+                unsafe { env::set_var("OLDPWD", old) };
+            }
+            if let Ok(new_pwd) = env::current_dir() {
+                let s = new_pwd.to_string_lossy().to_string();
+                state.vars.insert("PWD".into(), s.clone());
+                unsafe { env::set_var("PWD", s) };
+            }
             state.prev_dir = cwd_before;
             0
         }
