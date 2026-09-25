@@ -313,6 +313,7 @@ fn fill_heredocs(
                         &state.vars,
                         &state.positional,
                         state.last_status,
+                        &mut |c| executor::substitute_string(c, state),
                     );
                 }
                 red.heredoc_body = Some(body);

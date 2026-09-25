@@ -301,6 +301,20 @@ fn expand_current(args: &[String], state: &mut ShellState) -> Vec<String> {
 /// simple simulation of a subshell having its own environment). Captures its
 /// stdout by redirecting the real file descriptor 1 to a temporary file (so
 /// it works with external processes too, not only builtins).
+/// Runs a `$(...)` substitution body against the current state and returns
+/// the captured stdout. Public so main can expand heredoc bodies.
+pub fn substitute_string(cmd: &str, state: &ShellState) -> String {
+    capture_subshell(
+        cmd,
+        &state.vars,
+        &state.aliases,
+        &state.functions,
+        &state.positional,
+        state.last_status,
+        &state.prev_dir,
+    )
+}
+
 fn capture_subshell(
     input: &str,
     vars: &HashMap<String, String>,

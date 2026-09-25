@@ -125,7 +125,7 @@ fn split_fields(s: &str) -> Vec<String> {
 /// replaces them with the captured command output. The captured result is
 /// marked entirely as literal, so it is not re-expanded or globbed by
 /// accident (avoids surprises if a file happens to be named "notas*.txt").
-fn expand_command_subst(input: &str, run: &mut dyn FnMut(&str) -> String) -> String {
+pub fn expand_command_subst(input: &str, run: &mut dyn FnMut(&str) -> String) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -658,13 +658,12 @@ pub fn expand_heredoc(
     vars: &HashMap<String, String>,
     positional: &[String],
     last_status: i32,
+    run_subst: &mut dyn FnMut(&str) -> String,
 ) -> String {
+    // $(...) command substitution first (POSIX), then $VAR expansion.
+    let after_subst = expand_command_subst(body, run_subst);
     let mut vars = vars.clone();
-    let mut out = String::new();
-    for line in body.split_inclusive('\n') {
-        out.push_str(&expand_vars(line, &mut vars, positional, last_status));
-    }
-    out
+    expand_vars(&after_subst, &mut vars, positional, last_status)
 }
 
 #[cfg(test)]
